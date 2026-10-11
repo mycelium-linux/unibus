@@ -7,6 +7,15 @@ unavailable, not an empty success. These are advertised routes, not installed
 models or a readiness guarantee. Deploy matching router/collector/WASM before
 enabling this optional strict-contract extension. No inference control is granted.
 
+The fleet example includes `models-spark` (Spark's Yggdrasil-advertised routes)
+and `models-titan` (Titan's Ollama-advertised routes). These reuse the same
+renderer, retention and read grant; no model downloads or runtime changes occur.
+The existing trusted collector projects remote observations into its configured
+access zone; that zone is not the source machine's physical site. SSH account
+overrides are explicit deployment inputs. Spark shared GPU memory is not inferred
+from NVIDIA's unavailable dedicated-VRAM counters. Add viewer definitions with
+the same producer, zone and telemetry capability before enabling source feeds.
+
 The router's `viewer` feature can retain bounded
 `coherence.widget.snapshot.v1` messages and render them with Coherence's shared
 Rust/WASM `gfx` host. UMIE and Shroud reuse the same renderer, loader and metric

@@ -274,6 +274,31 @@
           ]
         }
       ]
+    },
+    {
+      "id": "models-spark",
+      "model_catalog_command": ["mycelium", "ssh", "spark-3539", "--user", "fpladmin", "--", "curl --max-time 3 -fsS http://192.168.1.48:8717/v1/models"],
+      "sources": [{
+        "command": ["mycelium", "ssh", "spark-3539", "--user", "fpladmin", "--", "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits"],
+        "metrics": [
+          {"id":"gpu-utilization","label":"Spark GPU utilization","unit":"%","column":0,"maximum":100},
+          {"id":"gpu-temperature","label":"Spark GPU temperature","unit":"°C","column":3},
+          {"id":"gpu-power","label":"Spark GPU power","unit":"W","column":4,"maximum_column":5}
+        ]
+      }]
+    },
+    {
+      "id": "models-titan",
+      "model_catalog_command": ["mycelium", "ssh", "titan", "--user", "avery", "--", "curl --max-time 3 -fsS http://127.0.0.1:11434/v1/models"],
+      "sources": [{
+        "command": ["mycelium", "ssh", "titan", "--user", "avery", "--", "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits"],
+        "metrics": [
+          {"id":"gpu-utilization","label":"Titan GPU utilization","unit":"%","column":0,"maximum":100},
+          {"id":"gpu-memory","label":"Titan GPU VRAM","unit":"MiB","column":1,"maximum_column":2},
+          {"id":"gpu-temperature","label":"Titan GPU temperature","unit":"°C","column":3},
+          {"id":"gpu-power","label":"Titan GPU power","unit":"W","column":4,"maximum_column":5}
+        ]
+      }]
     }
   ]
 }
