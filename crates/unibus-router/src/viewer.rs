@@ -29,6 +29,8 @@ const MAX_RESPONSE: usize = 1024 * 1024;
 const DEADLINE: Duration = Duration::from_secs(10);
 const CSS: &str = include_str!("viewer/coherence-product.css");
 const LAYOUT: &str = include_str!("viewer/layout.css");
+// Shared Coherence observed-resource primitives, owner commit 1057fb4.
+const RESOURCES_CSS: &str = include_str!("viewer/coherence-resource-workspace.css");
 mod advertisement;
 #[path = "../../../vendor/coherence-viewer-shell/lib.rs"]
 #[allow(dead_code)]
@@ -530,7 +532,7 @@ fn connection(
             &mut stream,
             200,
             "text/css; charset=utf-8",
-            format!("{LAYOUT}\n{}", shell::CSS).as_bytes(),
+            format!("{LAYOUT}\n{}\n{RESOURCES_CSS}", shell::CSS).as_bytes(),
         ),
         "/api/index" => response(
             &mut stream,
@@ -649,11 +651,25 @@ fn with_switcher(page: String, other: Option<&str>) -> String {
     )
 }
 fn render_widget(definition: &widgets::Definition) -> String {
-    format!(
+    let page = format!(
         "<!doctype html><html lang=\"en\" data-co-profile=\"product\" data-co-theme=\"dark\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title} · Coherence</title><link rel=\"stylesheet\" href=\"/coherence.css\"><link rel=\"stylesheet\" href=\"/viewer.css\"><link rel=\"stylesheet\" href=\"/widgets/widgets.css\"><script type=\"module\" src=\"/widgets/coherence-widgets.js\"></script></head><body><main class=\"co-container\"><a href=\"/\">Unibus index</a><h1>{title}</h1><p>Authorized read-only telemetry · {zone}</p><section class=\"co-widget\" data-co-widget=\"{id}\"><p data-co-status role=\"status\">Connecting to owner telemetry</p><canvas aria-hidden=\"true\"></canvas><div class=\"co-widget__labels\" data-co-labels></div></section></main></body></html>",
         title = escape(&definition.title),
         zone = escape(&definition.zone),
         id = escape(&definition.id)
+    );
+    let context = format!(
+        "<nav class=\"co-viewer-sites\" aria-label=\"Dashboards\"><a class=\"co-btn\" href=\"/\">Resource index</a></nav><section class=\"co-card co-resource-panel\"><p>Owner: {} · Access zone: {} · Capability: {}</p><p data-co-summary=\"{}\" role=\"status\">Waiting for retained owner snapshot</p><p>History is sampled telemetry, not a live frame stream. Capacity ratios use the owner's reported limit. Missing measurements remain unavailable.</p><a href=\"/api/widgets/{}\">Snapshot JSON</a></section><aside data-co-insights=\"{}\" aria-label=\"Telemetry notices\" aria-live=\"polite\"></aside>",
+        escape(&definition.producer_id),
+        escape(&definition.zone),
+        escape(&definition.capability),
+        escape(&definition.id),
+        escape(&definition.id),
+        escape(&definition.id)
+    );
+    page.replacen(
+        "<section class=\"co-widget\"",
+        &format!("{context}<section class=\"co-widget\""),
+        1,
     )
 }
 fn render_index(
@@ -663,17 +679,27 @@ fn render_index(
     hub: &Hub,
     principal: &str,
 ) -> String {
-    let mut links = String::from("<nav aria-label=\"Live views\">");
+    let mut links = String::from(
+        "<section aria-label=\"Owner dashboards\"><h2>Owner dashboards</h2><div class=\"co-resource-grid\">",
+    );
     for definition in definitions {
-        if hub.viewer_widget(principal, definition).is_ok() {
+        if let Ok(value) = hub.viewer_widget(principal, definition) {
+            let now = unibus::envelope::now_ms();
+            let state = match &value {
+                None => "Connecting",
+                Some(s) if s.fresh_at(now) => "Live",
+                Some(_) => "Stale — retained data",
+            };
+            let count = value.as_ref().map_or(0, |s| s.metrics.len());
             links.push_str(&format!(
-                "<a class=\"co-btn\" href=\"/views/{}\">{}</a> ",
+                "<article class=\"co-card co-resource-panel\"><p class=\"co-card__meta\">{} · {} signals</p><h3><a href=\"/views/{}\">{}</a></h3><p>Owner: {} · Zone: {}</p><p>{}</p></article>",
+                state, count,
                 escape(&definition.id),
-                escape(&definition.title)
+                escape(&definition.title), escape(&definition.producer_id), escape(&definition.zone), escape(&definition.capability)
             ));
         }
     }
-    links.push_str("</nav><form");
+    links.push_str("</div></section><form");
     render(snapshot, query).replacen("<form", &links, 1)
 }
 fn escape(value: &str) -> String {
@@ -715,7 +741,7 @@ pub fn render(snapshot: &Snapshot, query: Option<&str>) -> String {
     let q = query.unwrap_or("");
     let needle = q.to_lowercase();
     let mut html = format!(
-        "<!doctype html><html lang=\"en\" data-co-profile=\"product\" data-co-theme=\"dark\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Unibus · Index</title><link rel=\"stylesheet\" href=\"/coherence.css\"><link rel=\"stylesheet\" href=\"/viewer.css\"></head><body><main class=\"co-container\"><header><p class=\"co-muted\">UNIBUS / RESOURCE INDEX</p><h1>Your connected environment</h1><p>Owner: {} · Local daemon, authorized scope · Read only</p></header><form action=\"/\" method=\"get\"><label for=\"search\">Find a resource or capability</label><input id=\"search\" class=\"co-input\" name=\"q\" type=\"search\" maxlength=\"256\" value=\"{}\"><button class=\"co-btn\" type=\"submit\">Search</button> <a class=\"co-btn\" href=\"/\">Refresh</a></form><p class=\"co-muted\">{} resources in scope. Heartbeat TTL: {} seconds. Snapshot: {} ms since epoch.</p><section class=\"resource-grid\" aria-label=\"Resources\">",
+        "<!doctype html><html lang=\"en\" data-co-profile=\"product\" data-co-theme=\"dark\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Unibus · Index</title><link rel=\"stylesheet\" href=\"/coherence.css\"><link rel=\"stylesheet\" href=\"/viewer.css\"></head><body><main class=\"co-container\"><header><p class=\"co-muted\">UNIBUS / RESOURCE INDEX</p><h1>Your connected environment</h1><p>Owner: {} · Local daemon, authorized scope · Read only</p></header><form action=\"/\" method=\"get\"><label for=\"search\">Find a resource or capability</label><input id=\"search\" class=\"co-input\" name=\"q\" type=\"search\" maxlength=\"256\" value=\"{}\"><button class=\"co-btn\" type=\"submit\">Search</button> <a class=\"co-btn\" href=\"/\">Refresh</a></form><p class=\"co-muted\">{} resources in scope. Heartbeat TTL: {} seconds. Snapshot: {} ms since epoch.</p><section class=\"resource-grid co-resource-grid\" aria-label=\"Resources\">",
         escape(&snapshot.installation_id),
         escape(q),
         snapshot.resources.len(),
@@ -723,6 +749,30 @@ pub fn render(snapshot: &Snapshot, query: Option<&str>) -> String {
         snapshot.observed_at_unix_ms
     );
     let mut visible = 0;
+    let registrations = snapshot
+        .resources
+        .iter()
+        .filter(|r| r.kind == "registration")
+        .count();
+    let live = snapshot
+        .resources
+        .iter()
+        .filter(|r| r.state == "live")
+        .count();
+    let stale = snapshot
+        .resources
+        .iter()
+        .filter(|r| r.state == "stale")
+        .count();
+    let routes = snapshot
+        .resources
+        .iter()
+        .filter(|r| r.kind == "route")
+        .count();
+    let summary = format!(
+        "<section class=\"co-resource-grid\" aria-label=\"Catalog overview\"><article class=\"co-card co-resource-panel\"><h2>{registrations}</h2><p>Authorized registrations · {live} live · {stale} stale</p></article><article class=\"co-card co-resource-panel\"><h2>{routes}</h2><p>Configured message routes · configuration is not stream liveness</p></article></section>"
+    );
+    html = html.replacen("</header>", &format!("</header>{summary}"), 1);
     for r in &snapshot.resources {
         if !format!(
             "{} {} {} {}",
@@ -739,7 +789,7 @@ pub fn render(snapshot: &Snapshot, query: Option<&str>) -> String {
         visible += 1;
         let _ = write!(
             html,
-            "<article class=\"co-card\"><p class=\"co-card__meta\">{} · {}</p><h2>{}</h2><p>{}</p><p>Zones: {}</p><details><summary>Resource details</summary><dl><dt>Identity</dt><dd>{}</dd><dt>Preview</dt><dd>Metadata only — no payload access granted by this index</dd><dt>Heartbeat age</dt><dd>{}</dd><dt>Wire schema</dt><dd>{}</dd></dl></details></article>",
+            "<article class=\"co-card co-resource-panel\"><p class=\"co-card__meta\">{} · {}</p><h2>{}</h2><p>{}</p><p>Zones: {}</p><details><summary>Resource details</summary><dl><dt>Identity</dt><dd>{}</dd><dt>Preview</dt><dd>Metadata only — no payload access granted by this index</dd><dt>Heartbeat age</dt><dd>{}</dd><dt>Wire schema</dt><dd>{}</dd></dl></details></article>",
             escape(r.kind),
             escape(r.state),
             escape(&r.title),
@@ -872,6 +922,30 @@ mod tests {
         config.listen = "127.0.0.1:8444".parse().unwrap();
         config.key_file = "relative.pem".into();
         assert!(config.validate().is_err());
+    }
+    #[test]
+    fn rich_dashboard_metadata_is_escaped_and_catalog_counts_are_truthful() {
+        let definition = widgets::Definition {
+            id: "umie".into(),
+            title: "<gpu>".into(),
+            producer_id: "<owner>".into(),
+            zone: "<zone>".into(),
+            capability: "umie.telemetry".into(),
+        };
+        let page = render_widget(&definition);
+        assert!(page.contains("data-co-summary=\"umie\""));
+        assert!(page.contains("data-co-insights=\"umie\""));
+        assert!(!page.contains("<owner>"));
+        assert!(page.contains("&lt;owner&gt;"));
+        let snapshot = Snapshot {
+            schema_version: 1,
+            installation_id: "neo".into(),
+            observed_at_unix_ms: 1,
+            scope: "local-daemon-authorized",
+            resources: vec![],
+        };
+        assert!(render(&snapshot, None).contains("0 live · 0 stale"));
+        assert!(render(&snapshot, None).contains("configuration is not stream liveness"));
     }
     #[test]
     fn index_is_not_silently_truncated_and_duplicate_ids_fail() {

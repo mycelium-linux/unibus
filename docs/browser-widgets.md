@@ -61,3 +61,22 @@ QA is separate from HTTP checks and WASM compilation.
 
 Mycelium owner-lease advertisement remains optional. Publishing a lease does
 not grant access, establish DNS aliases, or make the local inventory global.
+# Rich telemetry panels
+
+The Agora source fixture exposes UMIE cache activity, lifetime mean worker and
+inference latency, GPU utilization/VRAM/temperature/power; Shroud exposes runtime
+capacity, configured guest allocations, tracked process RSS, networking, service
+discovery and lifecycle counters. These describe Agora, not a complete fleet.
+
+Collector selectors support `divide_by` (an exact scalar series; a zero/missing
+denominator is unavailable) and `sum: true` (aggregate an exact labeled series
+family; a missing family is unavailable). Ratios are computed in f64 before
+conversion to the bounded widget f32 contract. Do not call lifetime means p50/p95,
+or configured allocations actual usage. No artificial latency is shown on idle
+UMIE when its measurement count is zero.
+
+Coherence derives capacity percentage, history scale, sample count and notices
+in Rust/WASM. Browser code creates text-only accessible labels. Capacity notices
+mean >=90% of a reported maximum, not a service-health verdict. Histories use
+samples, not invented time axes. Missing/stale data remains explicit.
+

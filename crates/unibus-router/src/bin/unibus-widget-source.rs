@@ -44,6 +44,12 @@ struct Selection {
     /// An exact Prometheus series selector, or a CSV column index.
     #[serde(default)]
     series: Option<String>,
+    /// Aggregate the exact named Prometheus family, including labeled samples.
+    #[serde(default)]
+    sum: bool,
+    /// Divide by another exact series; zero/missing denominator is unavailable.
+    #[serde(default)]
+    divide_by: Option<String>,
     #[serde(default)]
     column: Option<usize>,
     #[serde(default)]
@@ -55,12 +61,12 @@ struct Selection {
     #[serde(default)]
     maximum_column: Option<usize>,
     #[serde(default = "one")]
-    divisor: f32,
+    divisor: f64,
 }
-fn one() -> f32 {
+fn one() -> f64 {
     1.
 }
-fn scalar(text: &str, selector: &str) -> Option<f32> {
+fn scalar(text: &str, selector: &str) -> Option<f64> {
     let mut values = text.lines().filter_map(|line| {
         let line = line.trim();
         if !line.starts_with(selector)
@@ -74,7 +80,7 @@ fn scalar(text: &str, selector: &str) -> Option<f32> {
         line[selector.len()..]
             .split_whitespace()
             .next()?
-            .parse::<f32>()
+            .parse::<f64>()
             .ok()
             .filter(|v| v.is_finite())
     });
@@ -84,19 +90,52 @@ fn scalar(text: &str, selector: &str) -> Option<f32> {
     }
     Some(first)
 }
+fn sum_family(text: &str, family: &str) -> Option<f64> {
+    let mut total = 0.;
+    let mut found = false;
+    for line in text.lines().map(str::trim) {
+        if !line.starts_with(family) {
+            continue;
+        }
+        let suffix = &line[family.len()..];
+        if !suffix.starts_with('{')
+            && !suffix
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_whitespace)
+        {
+            continue;
+        }
+        let value = line.split_whitespace().nth(1)?.parse::<f64>().ok()?;
+        if !value.is_finite() {
+            return None;
+        }
+        total += value;
+        found = true;
+    }
+    found.then_some(total).filter(|v| v.is_finite())
+}
 fn selected(text: &str, metric: &Selection) -> (Option<f32>, Option<f32>) {
     let value = match (&metric.series, metric.column) {
+        (Some(series), None) if metric.sum => sum_family(text, series),
         (Some(series), None) => scalar(text, series),
         (None, Some(column)) if text.lines().count() == 1 => text
             .trim()
             .split(',')
             .nth(column)
-            .and_then(|s| s.trim().parse::<f32>().ok())
+            .and_then(|s| s.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite()),
         _ => None,
     };
     let value = if let Some(subtract) = &metric.subtract {
         value.zip(scalar(text, subtract)).map(|(a, b)| a - b)
+    } else {
+        value
+    };
+    let value = if let Some(denominator) = &metric.divide_by {
+        value
+            .zip(scalar(text, denominator).filter(|d| *d > 0.))
+            .map(|(n, d)| n / d)
     } else {
         value
     };
@@ -113,18 +152,20 @@ fn selected(text: &str, metric: &Selection) -> (Option<f32>, Option<f32>) {
                         .parse::<f32>()
                         .ok()
                 })
-                .map(|v| v / metric.divisor)
+                .map(|v| (f64::from(v) / metric.divisor) as f32)
         })
         .or_else(|| {
             metric
                 .maximum_series
                 .as_deref()
                 .and_then(|s| scalar(text, s))
-                .map(|v| v / metric.divisor)
+                .map(|v| (v / f64::from(metric.divisor)) as f32)
         })
         .filter(|v| *v > 0. && v.is_finite());
     (
-        value.map(|v| v / metric.divisor).filter(|v| v.is_finite()),
+        value
+            .map(|v| (v / f64::from(metric.divisor)) as f32)
+            .filter(|v| v.is_finite()),
         maximum,
     )
 }
@@ -248,7 +289,9 @@ fn main() -> Result<()> {
         for source in &feed.sources {
             for metric in &source.metrics {
                 ensure!(
-                    metric.divisor.is_finite() && metric.divisor > 0.,
+                    metric.divisor.is_finite()
+                        && metric.divisor > 0.
+                        && (!metric.sum || (metric.series.is_some() && metric.column.is_none())),
                     "invalid metric divisor"
                 );
             }
@@ -322,5 +365,21 @@ mod tests {
             scalar("load{interval=\"1m\"} 3", "load{interval=\"1m\"}"),
             Some(3.)
         );
+    }
+    #[test]
+    fn family_sum_and_ratio_do_not_invent_missing_observations() {
+        assert_eq!(
+            sum_family(
+                "vm{state=\"ready\"} 1\nvm{state=\"stale\"} 2\nvm_extra 99",
+                "vm"
+            ),
+            Some(3.)
+        );
+        assert_eq!(sum_family("vm_extra 0", "vm"), None);
+        assert_eq!(sum_family("vm{state=\"ready\"} NaN", "vm"), None);
+        let selection: Selection = serde_json::from_str(r#"{"id":"latency","label":"Mean latency","unit":"ms","series":"sum","divide_by":"count","divisor":0.001}"#).unwrap();
+        assert_eq!(selected("sum 1\ncount 2", &selection).0, Some(500.));
+        assert_eq!(selected("sum 0\ncount 0", &selection).0, None);
+        assert_eq!(selected("sum 1", &selection).0, None);
     }
 }
