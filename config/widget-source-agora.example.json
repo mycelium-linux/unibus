@@ -4,8 +4,14 @@
     "producer_id": "agora-widgets",
     "hub_endpoint": "127.0.0.1:17441",
     "token_file": "widgets.token",
-    "zones": ["wagar-house"],
-    "capabilities": ["widget.source", "umie.telemetry", "shroud.telemetry"],
+    "zones": [
+      "wagar-house"
+    ],
+    "capabilities": [
+      "widget.source",
+      "umie.telemetry",
+      "shroud.telemetry"
+    ],
     "schema_version": 2
   },
   "zone": "wagar-house",
@@ -15,28 +21,125 @@
       "id": "umie",
       "sources": [
         {
-          "command": ["mycelium", "ssh", "agora-one", "--", "curl --max-time 3 -fsS http://127.0.0.1:8112/metrics"],
+          "command": [
+            "mycelium",
+            "ssh",
+            "agora-one",
+            "--",
+            "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits"
+          ],
           "metrics": [
-            {"id":"requests","label":"UMIE requests","unit":"requests","series":"umie_requests_total"},
-            {"id":"errors","label":"Request errors","unit":"errors","series":"umie_request_errors_total"},
-            {"id":"in-flight","label":"In-flight sequences","unit":"sequences","series":"umie_in_flight_sequences"},
-            {"id":"kv-reserved","label":"KV cache reserved","unit":"tokens","series":"umie_kv_cache_reserved_tokens","maximum_series":"umie_kv_cache_capacity_tokens"},
-            {"id":"prefix-memory","label":"Prefix cache","unit":"MiB","series":"umie_prefix_cache_used_bytes","maximum_series":"umie_prefix_cache_budget_bytes","divisor":1048576},
-            {"id":"worker-mean","label":"Worker turnaround · lifetime mean","unit":"ms","series":"umie_worker_turnaround_seconds_sum","divide_by":"umie_worker_turnaround_seconds_count","divisor":0.001},
-            {"id":"inference-mean","label":"Inference · lifetime mean","unit":"ms","series":"umie_inference_seconds_sum","divide_by":"umie_inference_seconds_count","divisor":0.001},
-            {"id":"prefix-entries","label":"Prefix cache entries","unit":"entries","series":"umie_prefix_cache_entries"},
-            {"id":"prefix-hits","label":"Prefix cache hits","unit":"hits","series":"umie_prefix_cache_hits_total"},
-            {"id":"prefix-misses","label":"Prefix cache misses","unit":"misses","series":"umie_prefix_cache_misses_total"},
-            {"id":"prefix-evictions","label":"Prefix cache evictions","unit":"evictions","series":"umie_prefix_cache_evictions_total"}
+            {
+              "id": "gpu-utilization",
+              "label": "Agora GPU utilization",
+              "unit": "%",
+              "column": 0,
+              "maximum": 100
+            },
+            {
+              "id": "gpu-memory",
+              "label": "Agora GPU VRAM",
+              "unit": "MiB",
+              "column": 1,
+              "maximum_column": 2
+            },
+            {
+              "id": "gpu-temperature",
+              "label": "Agora GPU temperature",
+              "unit": "°C",
+              "column": 3
+            },
+            {
+              "id": "gpu-power",
+              "label": "Agora GPU power",
+              "unit": "W",
+              "column": 4,
+              "maximum_column": 5
+            }
           ]
         },
         {
-          "command": ["mycelium", "ssh", "agora-one", "--", "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits"],
+          "command": [
+            "mycelium",
+            "ssh",
+            "agora-one",
+            "--",
+            "curl --max-time 3 -fsS http://127.0.0.1:8112/metrics"
+          ],
           "metrics": [
-            {"id":"gpu-utilization","label":"Agora GPU utilization","unit":"%","column":0,"maximum":100},
-            {"id":"gpu-memory","label":"Agora GPU VRAM","unit":"MiB","column":1,"maximum_column":2},
-            {"id":"gpu-temperature","label":"Agora GPU temperature","unit":"°C","column":3},
-            {"id":"gpu-power","label":"Agora GPU power","unit":"W","column":4,"maximum_column":5}
+            {
+              "id": "requests",
+              "label": "UMIE requests",
+              "unit": "requests",
+              "series": "umie_requests_total"
+            },
+            {
+              "id": "errors",
+              "label": "Request errors",
+              "unit": "errors",
+              "series": "umie_request_errors_total"
+            },
+            {
+              "id": "in-flight",
+              "label": "In-flight sequences",
+              "unit": "sequences",
+              "series": "umie_in_flight_sequences"
+            },
+            {
+              "id": "kv-reserved",
+              "label": "KV cache reserved",
+              "unit": "tokens",
+              "series": "umie_kv_cache_reserved_tokens",
+              "maximum_series": "umie_kv_cache_capacity_tokens"
+            },
+            {
+              "id": "prefix-memory",
+              "label": "Prefix cache",
+              "unit": "MiB",
+              "series": "umie_prefix_cache_used_bytes",
+              "maximum_series": "umie_prefix_cache_budget_bytes",
+              "divisor": 1048576
+            },
+            {
+              "id": "worker-mean",
+              "label": "Worker turnaround · lifetime mean",
+              "unit": "ms",
+              "series": "umie_worker_turnaround_seconds_sum",
+              "divide_by": "umie_worker_turnaround_seconds_count",
+              "divisor": 0.001
+            },
+            {
+              "id": "inference-mean",
+              "label": "Inference · lifetime mean",
+              "unit": "ms",
+              "series": "umie_inference_seconds_sum",
+              "divide_by": "umie_inference_seconds_count",
+              "divisor": 0.001
+            },
+            {
+              "id": "prefix-entries",
+              "label": "Prefix cache entries",
+              "unit": "entries",
+              "series": "umie_prefix_cache_entries"
+            },
+            {
+              "id": "prefix-hits",
+              "label": "Prefix cache hits",
+              "unit": "hits",
+              "series": "umie_prefix_cache_hits_total"
+            },
+            {
+              "id": "prefix-misses",
+              "label": "Prefix cache misses",
+              "unit": "misses",
+              "series": "umie_prefix_cache_misses_total"
+            },
+            {
+              "id": "prefix-evictions",
+              "label": "Prefix cache evictions",
+              "unit": "evictions",
+              "series": "umie_prefix_cache_evictions_total"
+            }
           ]
         }
       ]
@@ -45,24 +148,128 @@
       "id": "shroud",
       "sources": [
         {
-          "command": ["mycelium", "ssh", "agora-one", "--", "curl --max-time 3 -fsS http://127.0.0.1:9108/metrics"],
+          "command": [
+            "mycelium",
+            "ssh",
+            "agora-one",
+            "--",
+            "curl --max-time 3 -fsS http://127.0.0.1:9108/metrics"
+          ],
           "metrics": [
-            {"id":"daemon","label":"Shroud daemon up","unit":"","series":"shroud_daemon_up","maximum":1},
-            {"id":"running-vms","label":"Running microVMs","unit":"VMs","series":"shroud_vm_running_total","maximum_series":"shroud_vm_configured_total"},
-            {"id":"configured-vms","label":"Configured microVMs","unit":"VMs","series":"shroud_vm_configured_total"},
-            {"id":"memory","label":"Host memory used","unit":"GiB","series":"shroud_host_memory_total_bytes","subtract":"shroud_host_memory_available_bytes","maximum_series":"shroud_host_memory_total_bytes","divisor":1073741824},
-            {"id":"disk","label":"Runtime disk used","unit":"GiB","series":"shroud_host_filesystem_size_bytes","subtract":"shroud_host_filesystem_free_bytes","maximum_series":"shroud_host_filesystem_size_bytes","divisor":1073741824},
-            {"id":"swap","label":"Host swap used","unit":"GiB","series":"shroud_host_swap_total_bytes","subtract":"shroud_host_swap_free_bytes","maximum_series":"shroud_host_swap_total_bytes","divisor":1073741824},
-            {"id":"load","label":"Host load · 1 minute","unit":"","series":"shroud_host_load_average{interval=\"1m\"}"},
-            {"id":"dns","label":"Guest DNS running","unit":"","series":"shroud_dnsmasq_running","maximum":1},
-            {"id":"nat","label":"Guest NAT enabled","unit":"","series":"shroud_network_nat_enabled","maximum":1},
-            {"id":"services","label":"Discoverable guest services","unit":"services","series":"shroud_service_discovery_records_total"},
-            {"id":"firewall","label":"Managed firewall rules","unit":"rules","series":"shroud_iptables_rules_total"},
-            {"id":"starts","label":"Successful VM starts","unit":"starts","series":"shroud_vm_lifecycle_events_total{event=\"start\"}"},
-            {"id":"stops","label":"Successful VM stops","unit":"stops","series":"shroud_vm_lifecycle_events_total{event=\"stop\"}"},
-            {"id":"vm-rss","label":"Tracked Firecracker RSS","unit":"MiB","series":"shroud_vm_process_resident_memory_bytes","sum":true,"divisor":1048576},
-            {"id":"vcpu","label":"Configured guest vCPUs","unit":"vCPUs","series":"shroud_vm_resource_cpu","sum":true},
-            {"id":"guest-memory","label":"Configured guest memory","unit":"GiB","series":"shroud_vm_resource_memory_mib","sum":true,"divisor":1024}
+            {
+              "id": "memory",
+              "label": "Host memory used",
+              "unit": "GiB",
+              "series": "shroud_host_memory_total_bytes",
+              "subtract": "shroud_host_memory_available_bytes",
+              "maximum_series": "shroud_host_memory_total_bytes",
+              "divisor": 1073741824
+            },
+            {
+              "id": "disk",
+              "label": "Runtime disk used",
+              "unit": "GiB",
+              "series": "shroud_host_filesystem_size_bytes",
+              "subtract": "shroud_host_filesystem_free_bytes",
+              "maximum_series": "shroud_host_filesystem_size_bytes",
+              "divisor": 1073741824
+            },
+            {
+              "id": "daemon",
+              "label": "Shroud daemon up",
+              "unit": "",
+              "series": "shroud_daemon_up",
+              "maximum": 1
+            },
+            {
+              "id": "running-vms",
+              "label": "Running microVMs",
+              "unit": "VMs",
+              "series": "shroud_vm_running_total",
+              "maximum_series": "shroud_vm_configured_total"
+            },
+            {
+              "id": "configured-vms",
+              "label": "Configured microVMs",
+              "unit": "VMs",
+              "series": "shroud_vm_configured_total"
+            },
+            {
+              "id": "swap",
+              "label": "Host swap used",
+              "unit": "GiB",
+              "series": "shroud_host_swap_total_bytes",
+              "subtract": "shroud_host_swap_free_bytes",
+              "maximum_series": "shroud_host_swap_total_bytes",
+              "divisor": 1073741824
+            },
+            {
+              "id": "load",
+              "label": "Host load · 1 minute",
+              "unit": "",
+              "series": "shroud_host_load_average{interval=\"1m\"}"
+            },
+            {
+              "id": "dns",
+              "label": "Guest DNS running",
+              "unit": "",
+              "series": "shroud_dnsmasq_running",
+              "maximum": 1
+            },
+            {
+              "id": "nat",
+              "label": "Guest NAT enabled",
+              "unit": "",
+              "series": "shroud_network_nat_enabled",
+              "maximum": 1
+            },
+            {
+              "id": "services",
+              "label": "Discoverable guest services",
+              "unit": "services",
+              "series": "shroud_service_discovery_records_total"
+            },
+            {
+              "id": "firewall",
+              "label": "Managed firewall rules",
+              "unit": "rules",
+              "series": "shroud_iptables_rules_total"
+            },
+            {
+              "id": "starts",
+              "label": "Successful VM starts",
+              "unit": "starts",
+              "series": "shroud_vm_lifecycle_events_total{event=\"start\"}"
+            },
+            {
+              "id": "stops",
+              "label": "Successful VM stops",
+              "unit": "stops",
+              "series": "shroud_vm_lifecycle_events_total{event=\"stop\"}"
+            },
+            {
+              "id": "vm-rss",
+              "label": "Tracked Firecracker RSS",
+              "unit": "MiB",
+              "series": "shroud_vm_process_resident_memory_bytes",
+              "sum": true,
+              "divisor": 1048576
+            },
+            {
+              "id": "vcpu",
+              "label": "Configured guest vCPUs",
+              "unit": "vCPUs",
+              "series": "shroud_vm_resource_cpu",
+              "sum": true
+            },
+            {
+              "id": "guest-memory",
+              "label": "Configured guest memory",
+              "unit": "GiB",
+              "series": "shroud_vm_resource_memory_mib",
+              "sum": true,
+              "divisor": 1024
+            }
           ]
         }
       ]

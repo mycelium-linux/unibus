@@ -658,11 +658,11 @@ fn render_widget(definition: &widgets::Definition) -> String {
         id = escape(&definition.id)
     );
     let context = format!(
-        "<nav class=\"co-viewer-sites\" aria-label=\"Dashboards\"><a class=\"co-btn\" href=\"/\">Resource index</a></nav><section class=\"co-card co-resource-panel\"><p>Owner: {} · Access zone: {} · Capability: {}</p><p data-co-summary=\"{}\" role=\"status\">Waiting for retained owner snapshot</p><p>History is sampled telemetry, not a live frame stream. Capacity ratios use the owner's reported limit. Missing measurements remain unavailable.</p><a href=\"/api/widgets/{}\">Snapshot JSON</a></section><aside data-co-insights=\"{}\" aria-label=\"Telemetry notices\" aria-live=\"polite\"></aside>",
+        "<p data-co-summary=\"{}\" role=\"status\">Waiting for retained owner snapshot</p><details class=\"co-widget-provenance\"><summary>Source and interpretation</summary><p>Owner: {} · Access zone: {} · Capability: {}</p><p>History is sampled telemetry, not a live frame stream. Capacity ratios use the owner's reported limit. Missing measurements remain unavailable.</p><a href=\"/api/widgets/{}\">Snapshot JSON</a></details><aside data-co-insights=\"{}\" aria-label=\"Telemetry notices\" aria-live=\"polite\"></aside>",
+        escape(&definition.id),
         escape(&definition.producer_id),
         escape(&definition.zone),
         escape(&definition.capability),
-        escape(&definition.id),
         escape(&definition.id),
         escape(&definition.id)
     );
