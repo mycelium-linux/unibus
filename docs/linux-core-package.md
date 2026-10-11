@@ -99,6 +99,22 @@ is untouched. Restart after config changes; no live reload is claimed.
 
 ## Local diagnostics
 
+### Notice-input packaging validation, 2026-10-11
+
+An isolated Agora checkout based on `9335ae8`, with the repaired owner lockfile
+and explicit notice-input packager, passed `cargo check --locked -p
+unibus-router --example linux_core_deb`, all 53 normal router/CLI/integration
+tests, six packager unit tests, and the explicitly enabled real `dpkg-deb`
+archive test using Rust 1.98.1. The latter checks verbatim notice installation,
+payload permissions and refusal to overwrite a finished archive. A live Canvas
+test remained ignored because this isolated run has no Canvas endpoint.
+
+The archive test packages the test executable and a clearly labeled fixture
+notice; it proves packaging mechanics only. No distributable owner payload,
+reviewed third-party closure, combined fungOS image or new QEMU qualification
+is asserted. The committed owner license remained `LicenseRef-Proprietary`;
+pending MIT/Apache edits were not incorporated or published.
+
 `unibusctl doctor [--config /path/hub.json] [--json]` is read-only and exits
 nonzero for a failed check. It reuses `HubConfig` validation, redacts invalid
 configuration values, and reports systemd load/active/enabled states. The
