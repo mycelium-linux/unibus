@@ -1,0 +1,14 @@
+Unibus core
+Copyright (c) 2026 Future Present Labs
+
+First-party Unibus workspace code is licensed under either the MIT License
+or the Apache License, Version 2.0, at the recipient's option.
+SPDX-License-Identifier: MIT OR Apache-2.0
+
+The complete first-party license texts are installed beside this file as
+LICENSE-MIT and LICENSE-APACHE.
+
+Third-party code retains its original licenses. When preparing a binary
+distribution, include the reviewed notice directory for the exact locked build
+using the owner packager. Those notices are installed in third-party-notices/.
+This first-party notice is not a declaration of complete dependency coverage.

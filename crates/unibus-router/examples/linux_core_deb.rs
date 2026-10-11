@@ -182,9 +182,85 @@ fn copyright(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn build(binary: &Path, doctor: &Path, directory: &Path, notices: &Path) -> Result<PathBuf> {
+fn notice_tree(root: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+    fn visit(
+        root: &Path,
+        here: &Path,
+        entries: &mut Vec<(PathBuf, Vec<u8>)>,
+        total: &mut usize,
+    ) -> Result<()> {
+        ensure!(
+            fs::symlink_metadata(here)?.is_dir(),
+            "notice root must be a regular directory"
+        );
+        for entry in fs::read_dir(here)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            ensure!(!kind.is_symlink(), "notice symlinks are forbidden");
+            let path = entry.path();
+            let relative = path.strip_prefix(root)?;
+            ensure!(
+                relative.components().count() <= 64,
+                "notice tree exceeds depth bound"
+            );
+            let name = relative.to_str().context("notice paths must be UTF-8")?;
+            ensure!(
+                !name.chars().any(char::is_control),
+                "notice path contains control characters"
+            );
+            if kind.is_dir() {
+                visit(root, &path, entries, total)?;
+            } else {
+                ensure!(kind.is_file(), "notice input must be a regular file");
+                ensure!(
+                    entry.metadata()?.len() <= 32 * 1024 * 1024,
+                    "notice file exceeds 32 MiB"
+                );
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                fs::File::open(&path)?
+                    .take(32 * 1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                ensure!(
+                    !bytes.is_empty() && bytes.len() <= 32 * 1024 * 1024,
+                    "empty or oversized notice file"
+                );
+                *total += bytes.len();
+                ensure!(
+                    *total <= 128 * 1024 * 1024 && entries.len() < 20000,
+                    "notice tree exceeds bounds"
+                );
+                entries.push((relative.to_owned(), bytes));
+            }
+        }
+        Ok(())
+    }
+    for ancestor in root.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+        ensure!(
+            !fs::symlink_metadata(ancestor)?.file_type().is_symlink(),
+            "notice root must not traverse symlinks"
+        );
+    }
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries, &mut 0)?;
+    ensure!(!entries.is_empty(), "notice tree is empty");
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(entries)
+}
+
+fn build(
+    binary: &Path,
+    doctor: &Path,
+    directory: &Path,
+    notices: &Path,
+    third_party: Option<&Path>,
+) -> Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let notices = copyright(notices)?;
+    let third_party = third_party
+        .map(notice_tree)
+        .transpose()?
+        .unwrap_or_default();
     let arch = architecture(&fs::read(binary)?)?;
     ensure!(
         architecture(&fs::read(doctor)?)? == arch,
@@ -230,6 +306,14 @@ fn build(binary: &Path, doctor: &Path, directory: &Path, notices: &Path) -> Resu
         "usr/share/doc/unibus-core/LICENSE-APACHE",
         LICENSE_APACHE.as_bytes(),
     )?;
+    for (path, bytes) in third_party {
+        let destination = Path::new("usr/share/doc/unibus-core/third-party-notices").join(path);
+        write(
+            &stage,
+            destination.to_str().context("notice destination UTF-8")?,
+            &bytes,
+        )?;
+    }
     write(
         &stage,
         "usr/lib/systemd/system/unibus-router.service",
@@ -271,14 +355,15 @@ fn build(binary: &Path, doctor: &Path, directory: &Path, notices: &Path) -> Resu
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().collect();
     ensure!(
-        args.len() == 5,
-        "usage: linux_core_deb ROUTER_EXECUTABLE UNIBUSCTL_EXECUTABLE OUTPUT_DIRECTORY COPYRIGHT_FILE"
+        matches!(args.len(), 5 | 6),
+        "usage: linux_core_deb ROUTER_EXECUTABLE UNIBUSCTL_EXECUTABLE OUTPUT_DIRECTORY COPYRIGHT_FILE [REVIEWED_NOTICE_DIRECTORY]"
     );
     build(
         Path::new(&args[1]),
         Path::new(&args[2]),
         Path::new(&args[3]),
         Path::new(&args[4]),
+        args.get(5).map(Path::new),
     )?;
     Ok(())
 }
@@ -286,6 +371,38 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn notice_tree_retains_exact_bytes_and_rejects_unsafe_inputs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        assert!(notice_tree(&root).is_err());
+        fs::create_dir(root.join("component")).unwrap();
+        let license = root.join("component/LICENSE");
+        fs::write(&license, b"original\xffnotice\n").unwrap();
+        let tree = notice_tree(&root).unwrap();
+        assert_eq!(
+            tree,
+            vec![(
+                PathBuf::from("component/LICENSE"),
+                b"original\xffnotice\n".to_vec()
+            )]
+        );
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&license, &link).unwrap();
+        assert!(notice_tree(&root).is_err());
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(root.join("component"), &link).unwrap();
+        assert!(notice_tree(&root).is_err());
+        assert!(notice_tree(&link).is_err());
+        fs::remove_file(&link).unwrap();
+        fs::File::create(&license)
+            .unwrap()
+            .set_len(32 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(notice_tree(&root).is_err());
+        fs::write(&license, b"").unwrap();
+        assert!(notice_tree(&root).is_err());
+    }
     #[test]
     fn copyright_input_is_explicit_bounded_and_regular() {
         let directory = tempfile::tempdir().unwrap();
@@ -316,7 +433,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("output");
         let missing = directory.path().join("missing");
-        assert!(build(&missing, &missing, &output, &missing).is_err());
+        assert!(build(&missing, &missing, &output, &missing, None).is_err());
         assert!(!output.exists());
     }
     #[test]
@@ -392,9 +509,16 @@ mod tests {
         .unwrap();
         // Packaging mechanics only: use this test's ELF, not a live service.
         let binary = std::env::current_exe().unwrap();
-        let archive = build(&binary, &binary, directory.path(), &notices).unwrap();
+        let tree = notices_dir.path().canonicalize().unwrap().join("tree");
+        fs::create_dir(&tree).unwrap();
+        fs::write(
+            tree.join("LICENSE"),
+            b"Original third-party fixture bytes\n",
+        )
+        .unwrap();
+        let archive = build(&binary, &binary, directory.path(), &notices, Some(&tree)).unwrap();
         let before = fs::read(&archive).unwrap();
-        assert!(build(&binary, &binary, directory.path(), &notices).is_err());
+        assert!(build(&binary, &binary, directory.path(), &notices, Some(&tree)).is_err());
         assert_eq!(fs::read(&archive).unwrap(), before);
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
         let extracted = tempfile::tempdir().unwrap();
@@ -410,6 +534,15 @@ mod tests {
         assert_eq!(
             fs::read(extracted.path().join("usr/share/doc/unibus-core/copyright")).unwrap(),
             fs::read(&notices).unwrap()
+        );
+        assert_eq!(
+            fs::read(
+                extracted
+                    .path()
+                    .join("usr/share/doc/unibus-core/third-party-notices/LICENSE")
+            )
+            .unwrap(),
+            fs::read(tree.join("LICENSE")).unwrap()
         );
         for (name, text) in [
             ("LICENSE-MIT", LICENSE_MIT),

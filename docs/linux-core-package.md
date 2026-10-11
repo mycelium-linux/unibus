@@ -47,7 +47,7 @@ to overwrite an existing package. It publishes only a completed archive, with
 fixed payload permissions independent of the builder's umask. Version comes
 from Cargo's package version. The explicit `--ignored` command runs its Debian
 archive integration check, which requires `readelf` and `dpkg-deb`.
-The required final argument is the owner's reviewed UTF-8 copyright/notice file.
+The required fourth argument is the owner's reviewed UTF-8 copyright/notice file.
 It is captured before output creation and installed verbatim at
 `/usr/share/doc/unibus-core/copyright`. Missing, blank, NUL-containing,
 non-regular, symlink-traversing or larger-than-4-MiB inputs fail closed.
@@ -55,12 +55,26 @@ The owner packager also installs the workspace's `LICENSE-MIT` and
 `LICENSE-APACHE` verbatim in that documentation directory. First-party Unibus
 is dual-licensed `MIT OR Apache-2.0`, at the recipient's option; see
 [licensing](../LICENSING.md). Dependencies retain their own licenses.
-The file must cover the shipped first-party code and linked third-party notices;
-review it against the actual locked build and both executable digests. Packaging
+An optional fifth argument supplies a reviewed directory of original dependency
+notices. It is captured before output creation and installed byte-for-byte under
+`third-party-notices/`; non-regular inputs, symlinks, empty files, control-character
+paths, excessive nesting, files over 32 MiB, more than 20,000 files, or totals over
+128 MiB fail closed. Original encodings are retained rather than rewritten.
+The copyright file and optional tree together must cover the shipped first-party
+code and linked third-party notices; review them against the actual locked build
+and both executable digests. Packaging
 validates the input container, not legal permission or completeness: passing an
 arbitrary text file is not redistribution approval. Retain its digest with the
 binary/source/lock provenance and corresponding-source archive. No license is
 inferred or silently changed by this tool. There is no default fixture notice.
+
+For a reviewed binary distribution, the owner first-party notice is available at
+`deploy/linux/core/copyright`. It explicitly does not claim dependency coverage.
+Supply the actual reviewed dependency tree as the fifth argument:
+
+```sh
+target/release/examples/linux_core_deb target/release/unibus-router target/release/unibusctl "$package_out" deploy/linux/core/copyright /absolute/path/to/reviewed-notices
+```
 
 The static control file remains the amd64 reference template; generated packages
 do not trust its architecture/version/libc values. `readelf` and `dpkg-deb` are
