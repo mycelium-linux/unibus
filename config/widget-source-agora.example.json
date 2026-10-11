@@ -19,6 +19,7 @@
   "feeds": [
     {
       "id": "umie",
+      "model_catalog_command": ["mycelium", "ssh", "agora-one", "--", "curl --max-time 3 -fsS http://127.0.0.1:8112/v1/models"],
       "sources": [
         {
           "command": [

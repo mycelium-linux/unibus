@@ -1,6 +1,8 @@
 //! Trusted-config telemetry collector. No browser-supplied commands or URLs.
-use anyhow::{Context, Result, ensure};
-use coherence_widget_contract::{MAX_HISTORY, MESSAGE_KIND, Metric, Snapshot};
+use anyhow::{ensure, Context, Result};
+use coherence_widget_contract::{
+    Metric, ModelCatalog, ServedModel, Snapshot, MAX_HISTORY, MESSAGE_KIND,
+};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -10,9 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 use unibus::{
-    Message,
     client::{Client, ClientConfig},
     envelope::now_ms,
+    Message,
 };
 
 #[derive(Deserialize)]
@@ -28,6 +30,8 @@ struct Config {
 struct Feed {
     id: String,
     sources: Vec<Source>,
+    #[serde(default)]
+    model_catalog_command: Option<Vec<String>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,6 +69,38 @@ struct Selection {
 }
 fn one() -> f64 {
     1.
+}
+fn served_models(text: &str) -> Result<ModelCatalog> {
+    #[derive(Deserialize)]
+    struct Response {
+        data: Vec<ServedModel>,
+    }
+    // OpenAI-compatible records may include object/capabilities; project only
+    // explicitly supported fields rather than leaking arbitrary provider JSON.
+    let value: serde_json::Value = serde_json::from_str(text)?;
+    let data = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .context("missing model list")?;
+    ensure!(data.len() <= 128, "too many served models");
+    let projected = serde_json::json!({"data": data.iter().map(|entry| serde_json::json!({
+        "id": entry.get("id"), "owned_by": entry.get("owned_by").unwrap_or(&serde_json::Value::Null)
+    })).collect::<Vec<_>>()});
+    let response: Response = serde_json::from_value(projected)?;
+    let catalog = ModelCatalog {
+        available: true,
+        entries: response.data,
+    };
+    let validation = Snapshot {
+        schema_version: 1,
+        widget_id: "catalog".into(),
+        observed_at_unix_ms: 1,
+        expires_at_unix_ms: 2,
+        metrics: vec![],
+        model_catalog: Some(catalog.clone()),
+    };
+    validation.validate().map_err(anyhow::Error::msg)?;
+    Ok(catalog)
 }
 fn scalar(text: &str, selector: &str) -> Option<f64> {
     let mut values = text.lines().filter_map(|line| {
@@ -333,12 +369,25 @@ fn main() -> Result<()> {
                 }
             }
             let now = now_ms();
+            let model_catalog = feed.model_catalog_command.as_ref().map(|command| {
+                match collect(command).and_then(|text| served_models(&text)) {
+                    Ok(catalog) => catalog,
+                    Err(error) => {
+                        eprintln!("widget {} model catalog unavailable: {error}", feed.id);
+                        ModelCatalog {
+                            available: false,
+                            entries: vec![],
+                        }
+                    }
+                }
+            });
             let snapshot = Snapshot {
                 schema_version: 1,
                 widget_id: feed.id.clone(),
                 observed_at_unix_ms: now,
                 expires_at_unix_ms: now + config.poll_seconds * 3000,
                 metrics,
+                model_catalog,
             };
             snapshot.validate().map_err(anyhow::Error::msg)?;
             let envelope = client.envelope(
@@ -355,6 +404,18 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn model_catalog_projects_only_bounded_unique_provider_identities() {
+        let catalog = served_models(r#"{"data":[{"id":"org/model","owned_by":"owner","object":"model","private_path":"/secret"}]}"#).unwrap();
+        assert_eq!(catalog.entries[0].id, "org/model");
+        assert!(served_models(
+            r#"{"data":[{"id":"same","owned_by":"a"},{"id":"same","owned_by":"b"}]}"#
+        )
+        .is_err());
+        assert!(served_models("{}").is_err());
+        assert!(served_models(r#"{"data":[{"id":"bad\nname","owned_by":"a"}]}"#).is_err());
+        assert!(served_models(r#"{"data":[]}"#).unwrap().entries.is_empty());
+    }
     #[test]
     fn exact_series_only_and_missing_is_not_zero() {
         assert_eq!(scalar("vm_count 0\nvm_count_extra 9", "vm_count"), Some(0.));

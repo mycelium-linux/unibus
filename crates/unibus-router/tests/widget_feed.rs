@@ -50,6 +50,7 @@ fn authenticated_bus_publication_reaches_only_the_authorized_projection() {
         observed_at_unix_ms: now,
         expires_at_unix_ms: now + 30000,
         metrics: vec![],
+        model_catalog: None,
     };
     let envelope = client
         .envelope(

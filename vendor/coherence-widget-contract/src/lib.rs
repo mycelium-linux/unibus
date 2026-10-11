@@ -65,12 +65,27 @@ pub struct Metric {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ServedModel {
+    pub id: String,
+    pub owned_by: String,
+}
+/// Provider-advertised serving routes, not a disk inventory or load guarantee.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCatalog {
+    pub available: bool,
+    pub entries: Vec<ServedModel>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Snapshot {
     pub schema_version: u16,
     pub widget_id: String,
     pub observed_at_unix_ms: u64,
     pub expires_at_unix_ms: u64,
     pub metrics: Vec<Metric>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog: Option<ModelCatalog>,
 }
 pub fn identifier(id: &str) -> bool {
     !id.is_empty()
@@ -93,6 +108,23 @@ impl Snapshot {
             return Err("invalid widget identity, version, size or lifetime");
         }
         let mut ids = std::collections::BTreeSet::new();
+        if let Some(catalog) = &self.model_catalog {
+            if catalog.entries.len() > 128 || (!catalog.available && !catalog.entries.is_empty()) {
+                return Err("invalid model catalog size or availability");
+            }
+            let mut models = std::collections::BTreeSet::new();
+            for model in &catalog.entries {
+                if model.id.is_empty()
+                    || model.id.len() > 256
+                    || model.id.chars().any(char::is_control)
+                    || model.owned_by.len() > 128
+                    || model.owned_by.chars().any(char::is_control)
+                    || !models.insert(&model.id)
+                {
+                    return Err("invalid or duplicate served model");
+                }
+            }
+        }
         for metric in &self.metrics {
             if !identifier(&metric.id)
                 || !ids.insert(&metric.id)
@@ -124,6 +156,7 @@ mod tests {
             widget_id: "umie".into(),
             observed_at_unix_ms: 1000,
             expires_at_unix_ms: 31000,
+            model_catalog: None,
             metrics: vec![Metric {
                 id: "gpu".into(),
                 label: "GPU use".into(),
@@ -133,6 +166,24 @@ mod tests {
                 history: vec![],
             }],
         }
+    }
+    #[test]
+    fn model_catalog_rejects_duplicate_and_unavailable_entries() {
+        let mut s = snapshot();
+        let model = ServedModel {
+            id: "org/model".into(),
+            owned_by: "owner".into(),
+        };
+        s.model_catalog = Some(ModelCatalog {
+            available: true,
+            entries: vec![model.clone()],
+        });
+        assert!(s.validate().is_ok());
+        s.model_catalog.as_mut().unwrap().entries.push(model);
+        assert!(s.validate().is_err());
+        s.model_catalog.as_mut().unwrap().entries.pop();
+        s.model_catalog.as_mut().unwrap().available = false;
+        assert!(s.validate().is_err());
     }
     #[test]
     fn unavailable_is_not_zero_and_expiry_is_exact() {

@@ -1,5 +1,12 @@
 # Optional Coherence telemetry views
 
+`model_catalog_command` on a feed can collect an OpenAI-compatible `/v1/models`
+response server-side. The collector projects only bounded, unique `id`/`owned_by`
+records into the shared Coherence catalog; failed collection is explicitly
+unavailable, not an empty success. These are advertised routes, not installed
+models or a readiness guarantee. Deploy matching router/collector/WASM before
+enabling this optional strict-contract extension. No inference control is granted.
+
 The router's `viewer` feature can retain bounded
 `coherence.widget.snapshot.v1` messages and render them with Coherence's shared
 Rust/WASM `gfx` host. UMIE and Shroud reuse the same renderer, loader and metric

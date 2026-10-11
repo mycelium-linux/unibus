@@ -192,6 +192,7 @@ mod tests {
             observed_at_unix_ms: 1000,
             expires_at_unix_ms: 31000,
             metrics: vec![],
+            model_catalog: None,
         };
         store.retain("source", "lab", snapshot, 1000).unwrap();
         let mut grant: NodeGrant =
@@ -215,6 +216,7 @@ mod tests {
             observed_at_unix_ms: 1000,
             expires_at_unix_ms: 31000,
             metrics: vec![],
+            model_catalog: None,
         };
         assert!(store.retain("source", "lab", snapshot, 1000).is_err());
         assert!(store.feeds.lock().unwrap().is_empty());
