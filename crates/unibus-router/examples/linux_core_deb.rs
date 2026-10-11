@@ -11,6 +11,8 @@ const CONFFILES: &str = include_str!("../../../deploy/linux/core/DEBIAN/conffile
 const CONFIG: &str = include_str!("../../../deploy/linux/core/etc/unibus/hub.json");
 const UNIT: &str =
     include_str!("../../../deploy/linux/core/usr/lib/systemd/system/unibus-router.service");
+const LICENSE_MIT: &str = include_str!("../../../LICENSE-MIT");
+const LICENSE_APACHE: &str = include_str!("../../../LICENSE-APACHE");
 
 fn architecture(header: &[u8]) -> Result<&'static str> {
     ensure!(
@@ -220,6 +222,16 @@ fn build(binary: &Path, doctor: &Path, directory: &Path, notices: &Path) -> Resu
     write(&stage, "usr/share/doc/unibus-core/copyright", &notices)?;
     write(
         &stage,
+        "usr/share/doc/unibus-core/LICENSE-MIT",
+        LICENSE_MIT.as_bytes(),
+    )?;
+    write(
+        &stage,
+        "usr/share/doc/unibus-core/LICENSE-APACHE",
+        LICENSE_APACHE.as_bytes(),
+    )?;
+    write(
+        &stage,
         "usr/lib/systemd/system/unibus-router.service",
         UNIT.as_bytes(),
     )?;
@@ -399,6 +411,21 @@ mod tests {
             fs::read(extracted.path().join("usr/share/doc/unibus-core/copyright")).unwrap(),
             fs::read(&notices).unwrap()
         );
+        for (name, text) in [
+            ("LICENSE-MIT", LICENSE_MIT),
+            ("LICENSE-APACHE", LICENSE_APACHE),
+        ] {
+            assert_eq!(
+                fs::read(
+                    extracted
+                        .path()
+                        .join("usr/share/doc/unibus-core")
+                        .join(name)
+                )
+                .unwrap(),
+                text.as_bytes()
+            );
+        }
         assert_eq!(
             fs::read(extracted.path().join("usr/bin/unibusctl")).unwrap(),
             fs::read(&binary).unwrap()
