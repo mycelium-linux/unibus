@@ -148,8 +148,41 @@ fn write(stage: &Path, path: &str, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn build(binary: &Path, doctor: &Path, directory: &Path) -> Result<PathBuf> {
+/// Capture reviewed owner notices once, before any package output is created.
+/// This validates the input container, not redistribution rights or coverage.
+fn copyright(path: &Path) -> Result<Vec<u8>> {
+    for ancestor in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+        ensure!(
+            !fs::symlink_metadata(ancestor)?.file_type().is_symlink(),
+            "copyright input must not traverse symlinks"
+        );
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(metadata.is_file(), "copyright input must be a regular file");
+    ensure!(
+        metadata.len() <= 4 * 1024 * 1024,
+        "copyright input exceeds 4 MiB"
+    );
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= 4 * 1024 * 1024,
+        "copyright input exceeds 4 MiB"
+    );
+    let text = std::str::from_utf8(&bytes).context("copyright input must be UTF-8")?;
+    ensure!(
+        !text.trim().is_empty() && !text.contains('\0'),
+        "copyright input is empty or contains NUL"
+    );
+    Ok(bytes)
+}
+
+fn build(binary: &Path, doctor: &Path, directory: &Path, notices: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
+    let notices = copyright(notices)?;
     let arch = architecture(&fs::read(binary)?)?;
     ensure!(
         architecture(&fs::read(doctor)?)? == arch,
@@ -184,6 +217,7 @@ fn build(binary: &Path, doctor: &Path, directory: &Path) -> Result<PathBuf> {
     write(&stage, "DEBIAN/control", control(arch, &glibc)?.as_bytes())?;
     write(&stage, "DEBIAN/conffiles", CONFFILES.as_bytes())?;
     write(&stage, "etc/unibus/hub.json", CONFIG.as_bytes())?;
+    write(&stage, "usr/share/doc/unibus-core/copyright", &notices)?;
     write(
         &stage,
         "usr/lib/systemd/system/unibus-router.service",
@@ -225,13 +259,14 @@ fn build(binary: &Path, doctor: &Path, directory: &Path) -> Result<PathBuf> {
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().collect();
     ensure!(
-        args.len() == 4,
-        "usage: linux_core_deb ROUTER_EXECUTABLE UNIBUSCTL_EXECUTABLE OUTPUT_DIRECTORY"
+        args.len() == 5,
+        "usage: linux_core_deb ROUTER_EXECUTABLE UNIBUSCTL_EXECUTABLE OUTPUT_DIRECTORY COPYRIGHT_FILE"
     );
     build(
         Path::new(&args[1]),
         Path::new(&args[2]),
         Path::new(&args[3]),
+        Path::new(&args[4]),
     )?;
     Ok(())
 }
@@ -239,6 +274,39 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn copyright_input_is_explicit_bounded_and_regular() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("copyright");
+        assert!(copyright(&path).is_err());
+        fs::write(&path, " \n").unwrap();
+        assert!(copyright(&path).is_err());
+        fs::write(&path, b"notice\0").unwrap();
+        assert!(copyright(&path).is_err());
+        fs::write(&path, [255]).unwrap();
+        assert!(copyright(&path).is_err());
+        fs::write(&path, "Owner notice\n").unwrap();
+        assert_eq!(copyright(&path).unwrap(), b"Owner notice\n");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(copyright(&link).is_err());
+        assert!(copyright(directory.path()).is_err());
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(4 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(copyright(&path).is_err());
+    }
+
+    #[test]
+    fn invalid_notices_do_not_create_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("output");
+        let missing = directory.path().join("missing");
+        assert!(build(&missing, &missing, &output, &missing).is_err());
+        assert!(!output.exists());
+    }
     #[test]
     fn derives_architecture_and_rejects_bad_headers() {
         let mut header = [0; 20];
@@ -303,11 +371,18 @@ mod tests {
     fn archive_is_complete_permissioned_and_cannot_be_overwritten() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
+        let notices_dir = tempfile::tempdir().unwrap();
+        let notices = notices_dir.path().canonicalize().unwrap().join("copyright");
+        fs::write(
+            &notices,
+            "Packaging test fixture only; not redistribution evidence.\n",
+        )
+        .unwrap();
         // Packaging mechanics only: use this test's ELF, not a live service.
         let binary = std::env::current_exe().unwrap();
-        let archive = build(&binary, &binary, directory.path()).unwrap();
+        let archive = build(&binary, &binary, directory.path(), &notices).unwrap();
         let before = fs::read(&archive).unwrap();
-        assert!(build(&binary, &binary, directory.path()).is_err());
+        assert!(build(&binary, &binary, directory.path(), &notices).is_err());
         assert_eq!(fs::read(&archive).unwrap(), before);
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
         let extracted = tempfile::tempdir().unwrap();
@@ -320,6 +395,10 @@ mod tests {
             ],
         )
         .unwrap();
+        assert_eq!(
+            fs::read(extracted.path().join("usr/share/doc/unibus-core/copyright")).unwrap(),
+            fs::read(&notices).unwrap()
+        );
         assert_eq!(
             fs::read(extracted.path().join("usr/bin/unibusctl")).unwrap(),
             fs::read(&binary).unwrap()

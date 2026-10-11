@@ -16,17 +16,13 @@ dynamic user. Discovery never grants authorization.
 
 ## Build and inspect (Linux, isolated working directory)
 
-Qualification input pins live in `deploy/linux/core/build-inputs.toml`:
-Rust **1.98.1** and Isochrone **bfd1ec2ae7ba46e6cadb8b94ed8e44e913a9951c**.
-Use `cargo +1.98.1` for every command below. Export that exact Isochrone
-revision into the sibling `isochrone/` directory with `git archive`, not a
-copy of an actively edited checkout. The committed lockfile resolves against
-this pinned sibling without regeneration. These are qualification pins, not
-a fleet software manifest or a new updater; the file does not automatically
-override a developer's workspace toolchain.
+Historical qualification input pins live in `deploy/linux/core/build-inputs.toml`.
+They describe the earlier image evidence below, not the current dependency graph.
+For new packages use the owner checkout's `Cargo.toml` and `Cargo.lock`; derive
+resolved Git revisions using `cargo metadata --locked`, rather than copying an
+actively edited sibling checkout. Use Rust **1.98.1** for the commands below.
 
-Run from a clean tracked-source checkout with the workspace's existing sibling
-Isochrone checkout available. The binary and packager must be built from the
+Run from a clean tracked-source checkout. The binary and packager must be built from the
 same revision, not copied from an unrelated shared target cache. An actively
 modified workspace may legitimately require a different lockfile; do not
 overwrite someone else's dependency work to make this gate pass.
@@ -39,7 +35,7 @@ cargo test --locked -p unibus-router --example linux_core_deb
 cargo test --locked -p unibus-router --example linux_core_deb -- --ignored
 cargo build --locked --release -p unibus-router --bins --example linux_core_deb
 package_out=$(mktemp -d /var/tmp/unibus-core-package.XXXXXX)
-target/release/examples/linux_core_deb target/release/unibus-router target/release/unibusctl "$package_out"
+target/release/examples/linux_core_deb target/release/unibus-router target/release/unibusctl "$package_out" /absolute/path/to/reviewed-copyright
 dpkg-deb --info "$package_out/unibus-core_0.1.0_amd64.deb"
 dpkg-deb --contents "$package_out/unibus-core_0.1.0_amd64.deb"
 ```
@@ -51,6 +47,17 @@ to overwrite an existing package. It publishes only a completed archive, with
 fixed payload permissions independent of the builder's umask. Version comes
 from Cargo's package version. The explicit `--ignored` command runs its Debian
 archive integration check, which requires `readelf` and `dpkg-deb`.
+The required final argument is the owner's reviewed UTF-8 copyright/notice file.
+It is captured before output creation and installed verbatim at
+`/usr/share/doc/unibus-core/copyright`. Missing, blank, NUL-containing,
+non-regular, symlink-traversing or larger-than-4-MiB inputs fail closed.
+The file must cover the shipped first-party code and linked third-party notices;
+review it against the actual locked build and both executable digests. Packaging
+validates the input container, not legal permission or completeness: passing an
+arbitrary text file is not redistribution approval. Retain its digest with the
+binary/source/lock provenance and corresponding-source archive. No license is
+inferred or silently changed by this tool. There is no default fixture notice.
+
 The static control file remains the amd64 reference template; generated packages
 do not trust its architecture/version/libc values. `readelf` and `dpkg-deb` are
 build dependencies, not runtime requirements. This does not yet guarantee
@@ -68,7 +75,7 @@ export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='qemu-aarch64 -L /usr/aarch
 cargo check --locked -p unibus-router --target aarch64-unknown-linux-gnu
 cargo test --locked -p unibus-router --target aarch64-unknown-linux-gnu
 cargo build --locked --release -p unibus-router --target aarch64-unknown-linux-gnu --bins --example linux_package_lifecycle
-target/release/examples/linux_core_deb target/aarch64-unknown-linux-gnu/release/unibus-router target/aarch64-unknown-linux-gnu/release/unibusctl "$package_out"
+target/release/examples/linux_core_deb target/aarch64-unknown-linux-gnu/release/unibus-router target/aarch64-unknown-linux-gnu/release/unibusctl "$package_out" /absolute/path/to/reviewed-copyright
 ```
 
 User-mode emulation checks Rust behavior, not systemd. Repeat the lifecycle
