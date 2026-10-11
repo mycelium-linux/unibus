@@ -138,6 +138,17 @@ the exact original conffile and service policy, removes fixture credentials and
 verifies access is denied again. Restoration failures are reported separately.
 No token, key, grant, WAN listener or fixture service enters public packages.
 
+The router's optional owner-local readiness endpoint is enabled only when both
+`UNIBUS_HEALTH_SOCKET` and `UNIBUS_HEALTH_CLIENT` are supplied. The socket must
+be absolute, live in an owner-only directory, and is created with mode `0600`.
+Its bounded `health\n` request returns `READY unibus\n` only after a real schema-2
+client successfully registers through loopback with explicitly configured
+credentials and grants. The client cannot claim application capabilities or
+screen anchors, and must use a 1–100 ms read timeout. Configuration is bounded
+to 1 MiB; partial environment configuration fails rather than silently disabling
+the probe. It is disabled in the shipped empty-grant default. Enabling it does
+not add an application grant or depend on Mycelium.
+
 This test uses the real owner framing/envelope types and the installed router,
 not a second router implementation. Loopback success does not qualify cross-host
 TLS/Iroh, media performance, persistence of routing state or a fleet rollout.

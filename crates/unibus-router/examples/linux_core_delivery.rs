@@ -181,6 +181,7 @@ fn proof(expected: &[String]) -> Result<()> {
     );
     let producer_token = token()?;
     let consumer_token = token()?;
+    let health_token = token()?;
     denied(&register(
         "local",
         "qa-producer",
@@ -191,7 +192,11 @@ fn proof(expected: &[String]) -> Result<()> {
     fs::create_dir(PRIVATE)?;
     fs::set_permissions(PRIVATE, fs::Permissions::from_mode(0o700))?;
     let result = (|| -> Result<()> {
-        for (name, token) in [("producer", &producer_token), ("consumer", &consumer_token)] {
+        for (name, token) in [
+            ("producer", &producer_token),
+            ("consumer", &consumer_token),
+            ("health", &health_token),
+        ] {
             let path = Path::new(PRIVATE).join(name);
             fs::write(&path, token)?;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
@@ -200,15 +205,31 @@ fn proof(expected: &[String]) -> Result<()> {
         fs::write(
             DROPIN,
             format!(
-                "[Service]\nLoadCredential=producer:{PRIVATE}/producer\nLoadCredential=consumer:{PRIVATE}/consumer\n"
+                "[Service]\nLoadCredential=producer:{PRIVATE}/producer\nLoadCredential=consumer:{PRIVATE}/consumer\nLoadCredential=health:{PRIVATE}/health\nLoadCredential=health-client:{PRIVATE}/health-client\nEnvironment=UNIBUS_HEALTH_SOCKET=/run/unibus/health.sock\nEnvironment=UNIBUS_HEALTH_CLIENT=/run/credentials/unibus-router.service/health-client\n"
             ),
         )?;
         let installation = format!("qa-{}", fs::read_to_string("/etc/machine-id")?.trim());
-        let config = json!({"installation_id":installation,"listen":"127.0.0.1:18790","allow_insecure_lan":false,"routes":[{"kind":KIND,"target":{"mode":"capability","name":"qa-receiver"}}],"nodes":[{"producer_id":"qa-producer","token_file":"/run/credentials/unibus-router.service/producer","capabilities":["qa-sender"],"zones":["default"],"publishes":[KIND],"publish_zones":["default"]},{"producer_id":"qa-consumer","token_file":"/run/credentials/unibus-router.service/consumer","capabilities":["qa-receiver"],"zones":["default"]}]});
+        let client = json!({"installation_id":installation,"producer_id":"qa-health","hub_endpoint":"127.0.0.1:18790","token_file":"/run/credentials/unibus-router.service/health","zones":["health"],"schema_version":2,"read_timeout_ms":100});
+        let client_path = Path::new(PRIVATE).join("health-client");
+        fs::write(&client_path, serde_json::to_vec(&client)?)?;
+        fs::set_permissions(&client_path, fs::Permissions::from_mode(0o600))?;
+        let config = json!({"installation_id":installation,"listen":"127.0.0.1:18790","allow_insecure_lan":false,"routes":[{"kind":KIND,"target":{"mode":"capability","name":"qa-receiver"}}],"nodes":[{"producer_id":"qa-producer","token_file":"/run/credentials/unibus-router.service/producer","capabilities":["qa-sender"],"zones":["default"],"publishes":[KIND],"publish_zones":["default"]},{"producer_id":"qa-consumer","token_file":"/run/credentials/unibus-router.service/consumer","capabilities":["qa-receiver"],"zones":["default"]},{"producer_id":"qa-health","token_file":"/run/credentials/unibus-router.service/health","capabilities":["health.probe"],"zones":["health"]}]});
         fs::write(CONFIG, serde_json::to_vec_pretty(&config)?)?;
         command("systemctl", &["daemon-reload"])?;
         command("systemctl", &["restart", UNIT])?;
         ready()?;
+        use std::io::{Read, Write};
+        let mut health = std::os::unix::net::UnixStream::connect("/run/unibus/health.sock")?;
+        health.set_read_timeout(Some(Duration::from_secs(2)))?;
+        health.set_write_timeout(Some(Duration::from_secs(2)))?;
+        health.write_all(b"health\n")?;
+        let mut reply = [0; 13];
+        health.read_exact(&mut reply)?;
+        ensure!(
+            &reply == b"READY unibus\n",
+            "authenticated owner readiness failed"
+        );
+        println!("FUNGOS_UNIBUS_OWNER_READINESS_VERIFIED");
         denied(&register(
             &installation,
             "qa-producer",
@@ -276,7 +297,7 @@ fn proof(expected: &[String]) -> Result<()> {
         command("systemctl", &["daemon-reload"])?;
         command("systemctl", &["restart", UNIT])?;
         ready()?;
-        for name in ["producer", "consumer"] {
+        for name in ["producer", "consumer", "health", "health-client"] {
             let path = Path::new(PRIVATE).join(name);
             if path.exists() {
                 fs::remove_file(path)?;
@@ -284,6 +305,10 @@ fn proof(expected: &[String]) -> Result<()> {
         }
         fs::remove_dir(PRIVATE)?;
         ensure!(fs::read(CONFIG)? == original, "original conffile changed");
+        ensure!(
+            !Path::new("/run/unibus/health.sock").exists(),
+            "fixture readiness listener survived restoration"
+        );
         denied(&register(
             "local",
             "qa-producer",
