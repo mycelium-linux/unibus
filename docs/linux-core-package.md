@@ -117,6 +117,31 @@ is untouched. Restart after config changes; no live reload is claimed.
 
 ## Local diagnostics
 
+### Installed-service delivery proof
+
+`linux_core_delivery` is an owner-side qualification example, not a deployed
+daemon or public boot hook. It refuses hosts and unmarked guests; it requires
+root, QEMU/KVM, the private `fungos-mycelium-package-validation` DMI marker and
+the existing private package-proof executable. Invoke it only in the separately
+assembled clone, with the SHA-256 values of the genuine installed router and CLI:
+
+```sh
+linux_core_delivery ROUTER_SHA256 CLI_SHA256
+```
+
+It verifies package ownership, installed executable hashes, active unprivileged
+service and rejection under the shipped empty-grant configuration. It then uses
+fresh private tokens and systemd `LoadCredential` for two bounded fixture grants,
+checks authenticated correlated schema-2 delivery with credential redaction,
+and rejects wrong-token/ungranted-capability registration. Finally it restores
+the exact original conffile and service policy, removes fixture credentials and
+verifies access is denied again. Restoration failures are reported separately.
+No token, key, grant, WAN listener or fixture service enters public packages.
+
+This test uses the real owner framing/envelope types and the installed router,
+not a second router implementation. Loopback success does not qualify cross-host
+TLS/Iroh, media performance, persistence of routing state or a fleet rollout.
+
 ### Notice-input packaging validation, 2026-10-11
 
 An isolated Agora checkout based on `9335ae8`, with the repaired owner lockfile
