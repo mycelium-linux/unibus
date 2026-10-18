@@ -87,6 +87,16 @@ and reports failure; it does not extend expiry. Revocation delivery requires
 connectivity and a successful reconciliation; the lease expiry bounds offline
 access. The service does not promise instantaneous revocation during partition.
 
+Qualified on two Linux hosts on 2026-10-17: an automatic issuer scheduler pass
+advanced the serial, gossip delivered that record to both local daemons, and
+both receiver timers updated their trust files without changing either bridge
+PID. A live TV request remained HTTP 200 and delivered 72.8 MB over 90 seconds
+through that change. The transfer was intentionally time-bounded (curl exit
+28), not a completed finite download. Stock FireTV UI playback remains a
+separate visual check. Qualification also passed 17 Iroh tests, seven adapter
+tests, three issuer-renewal tests and the isolated offline SSH-renewal gossip
+integration test.
+
 ## UDP compatibility for existing adapters
 
 `unibus-iroh-udp CONFIG.json` carries bounded loopback UDP packets on authorized
