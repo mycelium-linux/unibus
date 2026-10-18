@@ -25,23 +25,69 @@ This API does not issue assertions, grant discovered devices access, publish
 endpoints, choose public relays, or couple adapters to Mycelium. Those remain
 the existing deployment, identity-provider, directory and policy boundaries.
 
-## HDHomeRun rollout boundary
+## Signed production permits
 
-The running HDHomeRun adapter still uses its existing QUIC/mTLS transport.
-Adding this API alone does **not** change its route or fix playback. Its next
-integration must map existing request/reply/media operations onto channels,
-retain tuner concurrency and disconnect cancellation, and obtain production
-session assertions through the existing authorization boundary. Do not replace
-the verifier with a JSON fixture or bypass certificate/identity checks.
+The optional `fleet-identity` feature includes `grant::GrantVerifier`. It uses
+the existing Mycelium `AccessRecord` signature and explicitly pinned access
+issuers, not a new CA or a JSON fixture. Its retained `TrustDocument` contains
+an authority-signed grant, signed revocations, and a `Permit`. The grant has
+exactly one `unibus-session:SHA256` scope. SHA256 covers compact JSON of the
+permit with recursively sorted object keys, as produced by `permit_scope`.
+This fits the shared access system's bounded selector format.
 
-The repository currently supplies the `DirectSessionVerifier` interface and
-test fixtures, not a production verifier/issuer wired into the tuner daemon.
-That wiring is a deployment prerequisite, not permission to trust discovered
-endpoint IDs or unsigned session JSON. Fleet membership proofs authenticate a
-machine; they are not themselves a grant to consume its tuner or other service.
+The permit binds the installation, audience, two producer/endpoint keys,
+message kinds and payload budget. These are access-policy fields, **not**
+permanent endpoint identity bindings. Local configuration maps each authorized
+service to its fixed local socket. No SSH account, sudo permission or issuer
+delegation is implied by this grant.
 
-Before changing the live proxy, verify bounded catalog requests, concurrent
-media streams, cancellation releasing a tuner, expiry/revocation, and sustained
-home-pi-to-Avery playback while Agora is unavailable. Retain the previous
-configuration and binaries for rollback. No site route or tuner firmware change
-is required for the Iroh path.
+Session parameters can be generated locally from this signed authorization;
+the verifier rejects any mismatch, widening, invalid lifetime or untrusted
+issuer. Iroh proves possession of both endpoint keys. Session JSON is therefore
+not a bearer credential and cannot grant discovered endpoints access. Sessions
+last at most five minutes, bounded by grant expiry; the compatibility client
+requests four-minute sessions and reconnects after expiration.
+
+Signatures refresh at most once per second from a bounded local document.
+Validity and operation scope are checked on every frame. An unreadable,
+invalid, revoked or expired document fails closed. This is a consumer of
+retained signed grants, **not** an automatic grant renewal or gossip reconciler.
+With systemd LoadCredential, replacing the retained document requires restarting
+the service to refresh its credential snapshot. Never claim immediate fleet
+revocation delivery unless that separate distribution/restart is verified.
+
+## UDP compatibility for existing adapters
+
+`unibus-iroh-udp CONFIG.json` carries bounded loopback UDP packets on authorized
+service channels. This lets existing Unibus QUIC/mTLS adapters use Iroh NAT
+traversal without replacing their existing authentication or protocol handlers.
+It intentionally retains inner mTLS for compatibility; native adapters may use
+service channels directly without this extra encryption/framing layer.
+
+Both roles require a private endpoint key, retained trust document, producer,
+explicit relay allowlist (empty disables relays), and explicit loopback `udp`
+socket. The client also needs remote endpoint hints. `iroh_bind` optionally sets
+the endpoint bind address; default is `0.0.0.0:0`. The server forwards only to
+its configured loopback service, never a destination supplied by a client.
+Each instance serves one admitted consumer and one local UDP producer; a local
+producer restart reopens the session instead of pinning a dead source port.
+Empty one-second keepalives do not reach the UDP service. There is no WAN route,
+IP forwarding, multicast bridge, or public tuner listener.
+
+Generate a key **on its host**, without overwriting an existing identity:
+
+```sh
+unibus-iroh-udp keygen /private/service/endpoint.key
+```
+
+`deploy/systemd/unibus-iroh-hdhomerun.service` uses a dynamic user, protected
+credentials, no capabilities, and bounded memory/tasks/file descriptors. Install
+host configuration and grant documents under `/etc/unibus-iroh-hdhomerun` as
+root-only files. Keys and live grants never belong in the repository.
+
+For HDHomeRun, the intended path is local proxy → loopback bridge → Iroh →
+owner loopback bridge → existing tuner owner → physical tuner. Stock LAN
+discovery and playback URLs remain unchanged. Before retiring an older path,
+verify fresh catalog, decoded media, cancellation, sustained transfer across
+session renewal, and restart recovery. Keep the prior configuration and binaries
+for rollback; record grant expiry and whether the path is direct or relayed.

@@ -1,0 +1,25 @@
+[Unit]
+Description=Unibus authorized Iroh packet compatibility transport
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+DynamicUser=yes
+LoadCredential=endpoint.key:/etc/unibus-iroh-hdhomerun/endpoint.key
+LoadCredential=trust.json:/etc/unibus-iroh-hdhomerun/trust.json
+LoadCredential=config.json:/etc/unibus-iroh-hdhomerun/config.json
+ExecStart=/usr/local/bin/unibus-iroh-udp /run/credentials/unibus-iroh-hdhomerun.service/config.json
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+MemoryMax=192M
+TasksMax=32
+LimitNOFILE=256
+
+[Install]
+WantedBy=multi-user.target

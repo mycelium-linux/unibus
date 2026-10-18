@@ -11,6 +11,8 @@ pub mod bus;
 pub mod directory;
 #[cfg(feature = "fleet-identity")]
 pub mod identity;
+#[cfg(feature = "fleet-identity")]
+pub mod grant;
 #[cfg(feature = "transport")]
 pub mod transport;
 
