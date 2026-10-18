@@ -9,11 +9,27 @@ Mycelium or changes routes. No generic USB, multicast, or LAN bridge is needed.
 ## Current placement
 
 * Physical device: CONNECT DUO, `10626E55`, `192.168.0.208`, two tuners.
-* Owner: Avery, private overlay `100.85.154.96:18504`.
+* Owner: Avery, loopback `127.0.0.1:18504` behind the authorized Iroh bridge.
 * Proxy: home-pi, `192.168.2.74`, permitted clients `192.168.2.0/24`.
-* Temporary packet relay: Agora, `192.168.2.67:18504`. Home-pi's overlay agent
-  needs login, so this deployment-only relay forwards encrypted QUIC packets.
-  It accepts only home-pi's source IP, with at most two relay children.
+* Private transport: home-pi's loopback bridge `127.0.0.1:18505` → Iroh →
+  Avery's loopback bridge → existing QUIC/mTLS tuner owner. The shared
+  `unibus-iroh-udp` executable uses a narrowly scoped grant signed by the
+  existing Mycelium access issuer. Original tuner certificates remain in use.
+* The former Agora packet relay is **not on this path**. Its old deployment
+  file remains for rollback/history; retiring that unused unit on Agora is
+  separate from removing the live dependency.
+
+See [Iroh service channels](iroh-service-channels.md) for the reusable transport,
+signed permit format, root-protected systemd service and grant refresh boundary.
+The pilot grant has a finite lease; replacing a grant/revocation document and
+restarting the credential-bearing unit is currently an operator action, not
+verified automatic gossip reconciliation.
+
+The October 17, 2026 qualification transferred 267,447,048 bytes with HTTP 200
+over 335 seconds, crossing a four-minute Iroh session expiry/reconnect. A
+separate stream probe found 1080p MPEG-2 video and AC-3 audio. Both services
+were active afterward and home-pi's catalog was fresh. This verifies transport,
+not a visual test of the stock FireTV application.
 
 The radio Pi is not needed. Moving the proxy means changing explicit LAN
 placement, not changing the HDHomeRun contract or coupling it to Radioman.
