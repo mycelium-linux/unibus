@@ -51,10 +51,41 @@ requests four-minute sessions and reconnects after expiration.
 Signatures refresh at most once per second from a bounded local document.
 Validity and operation scope are checked on every frame. An unreadable,
 invalid, revoked or expired document fails closed. This is a consumer of
-retained signed grants, **not** an automatic grant renewal or gossip reconciler.
-With systemd LoadCredential, replacing the retained document requires restarting
-the service to refresh its credential snapshot. Never claim immediate fleet
-revocation delivery unless that separate distribution/restart is verified.
+retained signed grants. Issuance and distribution remain separate adapters.
+
+### Automatic renewal and gossip reconciliation
+
+The issuer's Mycelium authority can explicitly schedule bounded grant renewal
+with `mycelium access renewal enable --grant ID --authorization-ttl 90d
+--credential-ttl 7d --renew-before 1d --write`. Only the original issuer key may
+renew; permissions and grant ID remain unchanged. Ordinary signed revocations
+stop renewal. Gossip transports the signed records, not issuer credentials.
+
+Build the optional receiving adapter with `cargo build --release -p
+unibus-mycelium --features grant-sync --bin unibus-mycelium-grants`.
+`unibus-mycelium-grants CONFIG.json` queries the local public `access_list` RPC,
+independently verifies pinned issuers, and atomically reconciles its retained
+trust document. Lower serials cannot roll it back; conflicting serials or
+changed permissions fail loudly. Signed revocations are retained across missing
+or older observations, including while a grant is expired or revoked.
+
+Use the provided systemd service/timer, a root-owned configuration, and a
+root-owned `/var/lib/unibus-iroh-hdhomerun` directory (0755). The JSON config
+contains `socket` (local Mycelium socket), `trust_file` (that directory's
+`trust.json`), and `issuers` (explicit public signing keys). Seed `trust.json`
+with the already verified signed document, mode 0644. Set the bridge's
+`trust_file` to that persistent path, **not** a LoadCredential snapshot.
+The bridge needs one restart to adopt this path; later trust changes refresh
+within one second without a playback restart. Private endpoint keys remain
+LoadCredential-protected. Neither the bridge user nor a gossip peer can write
+the trust file. The adapter needs privileged local IPC access, not an issuer key.
+
+Manual runbook: run the adapter once, inspect its exit status, compare the
+retained grant's serial/expiry, then enable the timer. The timer checks every
+30–40 seconds without overlap. RPC failure preserves the last good document
+and reports failure; it does not extend expiry. Revocation delivery requires
+connectivity and a successful reconciliation; the lease expiry bounds offline
+access. The service does not promise instantaneous revocation during partition.
 
 ## UDP compatibility for existing adapters
 

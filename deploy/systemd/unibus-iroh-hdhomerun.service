@@ -6,7 +6,6 @@ After=network-online.target
 [Service]
 DynamicUser=yes
 LoadCredential=endpoint.key:/etc/unibus-iroh-hdhomerun/endpoint.key
-LoadCredential=trust.json:/etc/unibus-iroh-hdhomerun/trust.json
 LoadCredential=config.json:/etc/unibus-iroh-hdhomerun/config.json
 ExecStart=/usr/local/bin/unibus-iroh-udp /run/credentials/unibus-iroh-hdhomerun.service/config.json
 Restart=on-failure

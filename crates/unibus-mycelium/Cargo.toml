@@ -5,9 +5,18 @@ edition.workspace = true
 license.workspace = true
 description = "Optional Mycelium peer-directory adapter for Unibus"
 
+[features]
+grant-sync = ["dep:unibus-iroh"]
+
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 unibus.workspace = true
 unibus-quic = { path = "../unibus-quic" }
+unibus-iroh = { path = "../unibus-iroh", features = ["fleet-identity"], optional = true }
+
+[[bin]]
+name = "unibus-mycelium-grants"
+path = "src/bin/unibus-mycelium-grants.rs"
+required-features = ["grant-sync"]

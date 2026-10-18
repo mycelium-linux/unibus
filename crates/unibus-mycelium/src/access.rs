@@ -11,6 +11,11 @@ impl MyceliumAccessAuthority {
         Self { socket }
     }
 
+    /// Signed public access records for a consumer-owned retained trust cache.
+    pub fn access_snapshot(&self) -> Result<Value> {
+        self.request("access_list")
+    }
+
     /// Peer IDs must be canonical IDs, not hostnames or display-name aliases.
     pub fn require_peer_scope(
         &self,

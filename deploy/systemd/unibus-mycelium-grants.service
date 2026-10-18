@@ -1,0 +1,16 @@
+[Unit]
+Description=Reconcile signed Unibus grants from local Mycelium gossip
+After=mycelium.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/unibus-mycelium-grants /etc/unibus-iroh-hdhomerun/grant-sync.json
+UMask=0022
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/unibus-iroh-hdhomerun
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX
+TimeoutStartSec=15
+MemoryMax=96M

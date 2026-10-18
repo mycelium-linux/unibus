@@ -1,6 +1,7 @@
 //! Service authorization from existing signed Mycelium access records.
 //! Identity/key bindings and service grants remain separate statements.
-use mycelium_peer_protocol::{AccessRecord, AccessStatement};
+pub use mycelium_peer_protocol::AccessRecord;
+use mycelium_peer_protocol::AccessStatement;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -41,6 +42,106 @@ pub fn permit_scope(permit: &Permit) -> Result<String, PeerError> {
         "{SCOPE_PREFIX}{}",
         mycelium_peer_protocol::sha256_hex(&canonical)
     ))
+}
+
+fn authorization_shape(record: &AccessRecord) -> Result<AccessStatement, PeerError> {
+    record.verify().map_err(PeerError)?;
+    let mut statement = record.statement.clone();
+    match &mut statement {
+        AccessStatement::Grant {
+            serial,
+            not_before,
+            not_after,
+            ..
+        } => {
+            *serial = 0;
+            *not_before = 0;
+            *not_after = 0;
+        }
+        _ => return Err(PeerError("expected service grant".into())),
+    }
+    Ok(statement)
+}
+
+/// Reconcile signed public records from any carrier. The retained document is
+/// the monotonic floor: missing/older observations cannot remove revocations or
+/// replace permissions. Carrier availability is never authorization.
+pub fn reconcile(
+    current: &TrustDocument,
+    grants: &[AccessRecord],
+    revocations: &[AccessRecord],
+    issuers: &BTreeSet<String>,
+) -> Result<TrustDocument, PeerError> {
+    let shape = authorization_shape(&current.grant)?;
+    if !issuers.contains(&current.grant.signer) {
+        return Err(PeerError("untrusted retained service issuer".into()));
+    }
+    let AccessStatement::Grant {
+        grant_id, scopes, ..
+    } = &current.grant.statement
+    else {
+        unreachable!()
+    };
+    if scopes
+        .iter()
+        .filter(|s| s.starts_with(SCOPE_PREFIX))
+        .count()
+        != 1
+        || !scopes.contains(&permit_scope(&current.permit)?)
+    {
+        return Err(PeerError(
+            "retained permit differs from signed scope".into(),
+        ));
+    }
+    let serial = |r: &AccessRecord| match r.statement {
+        AccessStatement::Grant { serial, .. } => serial,
+        _ => 0,
+    };
+    let mut next = current.clone();
+    for record in grants {
+        if !matches!(&record.statement, AccessStatement::Grant { grant_id:id,.. } if id == grant_id)
+        {
+            continue;
+        }
+        if record.signer != current.grant.signer || authorization_shape(record)? != shape {
+            return Err(PeerError(
+                "service renewal changes issuer or authorization".into(),
+            ));
+        }
+        if serial(record) == serial(&next.grant) && record != &next.grant {
+            return Err(PeerError("conflicting service renewal serial".into()));
+        }
+        if serial(record) > serial(&next.grant) {
+            next.grant = record.clone();
+        }
+    }
+    for record in current.revocations.iter().chain(revocations) {
+        record.verify().map_err(PeerError)?;
+        if !issuers.contains(&record.signer)
+            || !matches!(record.statement, AccessStatement::Revoke { .. })
+        {
+            return Err(PeerError("untrusted service revocation".into()));
+        }
+        // Retain serial-scoped revocations too; a later replay must not erase them.
+        let relevant = match &record.statement {
+            AccessStatement::Revoke {
+                grant_id: id,
+                principal,
+                ..
+            } => {
+                id.as_ref() == Some(grant_id)
+                    || matches!(&current.grant.statement, AccessStatement::Grant { principal:p,.. } if principal.as_ref()==Some(p))
+            }
+            _ => false,
+        };
+        if relevant && !next.revocations.contains(record) {
+            next.revocations.push(record.clone());
+        }
+    }
+    if next.revocations.len() > 64 {
+        return Err(PeerError("service revocation bound exceeded".into()));
+    }
+    Ok(next)
 }
 
 /// Only explicitly configured issuer keys are trusted. Remote session JSON
@@ -271,6 +372,72 @@ mod tests {
         let verifier =
             GrantVerifier::new(path, BTreeSet::from([document.grant.signer.clone()])).unwrap();
         (dir, verifier, document, key)
+    }
+
+    #[test]
+    fn reconciliation_retains_revocations_and_monotonic_permissions() {
+        let (_dir, _, initial, key) = fixture();
+        let mut statement = initial.grant.statement.clone();
+        if let AccessStatement::Grant {
+            serial, not_after, ..
+        } = &mut statement
+        {
+            *serial = 2;
+            *not_after = 2000;
+        }
+        let renewed = AccessRecord::sign(&key, statement).unwrap();
+        let issuers = BTreeSet::from([initial.grant.signer.clone()]);
+        let next = reconcile(&initial, &[renewed.clone()], &[], &issuers).unwrap();
+        assert_eq!(next.grant, renewed);
+        assert_eq!(
+            reconcile(&next, &[initial.grant.clone()], &[], &issuers)
+                .unwrap()
+                .grant,
+            renewed
+        );
+        let revoke = AccessRecord::sign(
+            &key,
+            serde_json::from_value(serde_json::json!({
+                "kind":"revoke", "revocation_id":"stop", "grant_id":"test-service",
+                "revoked_at":150, "reason":"test"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let revoked = reconcile(&next, &[], &[revoke.clone()], &issuers).unwrap();
+        assert_eq!(
+            reconcile(&revoked, &[], &[], &issuers).unwrap().revocations,
+            vec![revoke]
+        );
+        let mut changed = renewed.statement.clone();
+        if let AccessStatement::Grant { roles, .. } = &mut changed {
+            roles.push("admin".into());
+        }
+        let changed = AccessRecord::sign(&key, changed).unwrap();
+        assert!(reconcile(&next, &[changed], &[], &issuers).is_err());
+        let mut collision = renewed.statement.clone();
+        if let AccessStatement::Grant { not_after, .. } = &mut collision {
+            *not_after += 1;
+        }
+        assert!(
+            reconcile(
+                &next,
+                &[AccessRecord::sign(&key, collision).unwrap()],
+                &[],
+                &issuers
+            )
+            .is_err()
+        );
+        let stranger = SigningKey::from_bytes(&[72; 32]);
+        assert!(
+            reconcile(
+                &next,
+                &[AccessRecord::sign(&stranger, renewed.statement).unwrap()],
+                &[],
+                &issuers
+            )
+            .is_err()
+        );
     }
 
     #[test]
