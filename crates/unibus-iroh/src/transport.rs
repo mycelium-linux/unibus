@@ -121,6 +121,20 @@ impl PeerTransport for IrohTransport {
         assertion: &'a str,
     ) -> PeerFuture<'a, Box<dyn PeerSession>> {
         Box::pin(async move {
+            Ok(Box::new(self.connect_session(candidate, assertion).await?) as Box<dyn PeerSession>)
+        })
+    }
+}
+
+impl IrohTransport {
+    /// Establish the same authenticated session as `PeerTransport::connect`,
+    /// retaining access to independently backpressured service channels.
+    pub fn connect_session<'a>(
+        &'a self,
+        candidate: &'a PeerCandidate,
+        assertion: &'a str,
+    ) -> PeerFuture<'a, IrohSession> {
+        Box::pin(async move {
             candidate.validate(now_s())?;
             let mut failures = Vec::new();
             for hint in &candidate.iroh_endpoints {
@@ -188,7 +202,7 @@ impl PeerTransport for IrohTransport {
                     };
                     session.authorize_admission(false).await?;
                     admission.0 = None;
-                    Ok(Box::new(session) as Box<dyn PeerSession>)
+                    Ok(session)
                 })
                 .await;
                 match result {
@@ -317,6 +331,42 @@ impl Drop for IrohSession {
 }
 
 impl IrohSession {
+    /// Open an independent, backpressured service channel on an admitted
+    /// session. Every chunk still passes the existing signed claims, identity
+    /// binding and live policy checks; opening a channel grants no new scope.
+    pub async fn open_channel(&self) -> Result<ServiceChannel<'_>, PeerError> {
+        self.authorize_admission(false).await?;
+        let (send, recv) = tokio::time::timeout(IO_LIMIT, self.connection.open_bi())
+            .await
+            .map_err(|_| error("service channel open timed out"))?
+            .map_err(|e| error(e.to_string()))?;
+        Ok(ServiceChannel {
+            session: self,
+            send,
+            recv,
+            failed: false,
+            send_finished: false,
+        })
+    }
+
+    /// Accept a channel without granting access to its bytes. `receive` must
+    /// verify the first frame before an application acts on the request.
+    pub async fn accept_channel(&self) -> Result<ServiceChannel<'_>, PeerError> {
+        self.authorize_admission(true).await?;
+        let remaining = Duration::from_secs(self.claims.exp.saturating_sub(now_s()));
+        let (send, recv) = tokio::time::timeout(remaining, self.connection.accept_bi())
+            .await
+            .map_err(|_| error("service session expired"))?
+            .map_err(|e| error(e.to_string()))?;
+        Ok(ServiceChannel {
+            session: self,
+            send,
+            recv,
+            failed: false,
+            send_finished: false,
+        })
+    }
+
     async fn authorize_admission(&self, incoming: bool) -> Result<(), PeerError> {
         self.config.verify_identity(
             &self.remote,
@@ -375,6 +425,107 @@ impl IrohSession {
             .authorize_frame(envelope, payload_len, source, now_ms())
             .map_err(|e| error(e.to_string()))
     }
+}
+
+/// Protocol-neutral, bounded frames on one bidirectional Iroh stream.
+///
+/// Use a fresh envelope for each chunk. The signed session's kinds and payload
+/// budget apply in both directions; endpoint discovery alone authorizes nothing.
+/// No raw stream handles escape this wrapper. Cancellation/error poisons the
+/// channel, preventing reuse after a partial length or frame has been consumed.
+pub struct ServiceChannel<'a> {
+    session: &'a IrohSession,
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+    failed: bool,
+    send_finished: bool,
+}
+
+impl ServiceChannel<'_> {
+    pub async fn send(&mut self, envelope: &Envelope, payload: &[u8]) -> Result<(), PeerError> {
+        if self.failed || self.send_finished {
+            return Err(error("service channel is closed or interrupted"));
+        }
+        self.failed = true;
+        self.session
+            .authorize(
+                envelope,
+                payload.len(),
+                &self.session.config.local_producer,
+                &self.session.remote,
+            )
+            .await?;
+        let bytes = unibus::encode_frame(envelope, payload).map_err(|e| error(e.to_string()))?;
+        let remaining = Duration::from_secs(self.session.claims.exp.saturating_sub(now_s()));
+        tokio::time::timeout(IO_LIMIT.min(remaining), async {
+            self.send
+                .write_all(&(bytes.len() as u32).to_be_bytes())
+                .await
+                .map_err(|e| error(e.to_string()))?;
+            self.send
+                .write_all(&bytes)
+                .await
+                .map_err(|e| error(e.to_string()))
+        })
+        .await
+        .map_err(|_| error("service send timed out or expired"))??;
+        self.failed = false;
+        Ok(())
+    }
+
+    pub async fn receive(&mut self) -> Result<(Envelope, Vec<u8>), PeerError> {
+        if self.failed {
+            return Err(error("service channel is closed or interrupted"));
+        }
+        self.failed = true;
+        let remaining = Duration::from_secs(self.session.claims.exp.saturating_sub(now_s()));
+        let bytes = tokio::time::timeout(IO_LIMIT.min(remaining), async {
+            let mut prefix = [0u8; 4];
+            self.recv
+                .read_exact(&mut prefix)
+                .await
+                .map_err(|e| error(e.to_string()))?;
+            let length = service_frame_length(prefix)?;
+            let mut bytes = vec![0; length];
+            self.recv
+                .read_exact(&mut bytes)
+                .await
+                .map_err(|e| error(e.to_string()))?;
+            Ok::<_, PeerError>(bytes)
+        })
+        .await
+        .map_err(|_| error("service receive timed out or expired"))??;
+        let (envelope, payload) = unibus::decode_frame(&bytes).map_err(|e| error(e.to_string()))?;
+        self.session
+            .authorize(
+                &envelope,
+                payload.len(),
+                &self.session.remote,
+                &self.session.config.local_producer,
+            )
+            .await?;
+        self.failed = false;
+        Ok((envelope, payload))
+    }
+
+    /// FIN is transport EOF, not a successful application response. Applications
+    /// must require their own terminal response to distinguish truncated media.
+    pub fn finish(&mut self) -> Result<(), PeerError> {
+        if self.failed || self.send_finished {
+            return Err(error("service channel is closed or interrupted"));
+        }
+        self.send.finish().map_err(|e| error(e.to_string()))?;
+        self.send_finished = true;
+        Ok(())
+    }
+}
+
+fn service_frame_length(prefix: [u8; 4]) -> Result<usize, PeerError> {
+    let length = u32::from_be_bytes(prefix);
+    if length == 0 || length > unibus::MAX_FRAME {
+        return Err(error("service frame length exceeds bound"));
+    }
+    Ok(length as usize)
 }
 
 impl PeerSession for IrohSession {
@@ -497,6 +648,12 @@ fn authentication_frame(envelope: &Envelope) -> Result<Vec<u8>, PeerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn service_lengths_are_bounded_before_allocation() {
+        assert!(service_frame_length(0u32.to_be_bytes()).is_err());
+        assert!(service_frame_length((unibus::MAX_FRAME + 1).to_be_bytes()).is_err());
+        assert_eq!(service_frame_length(1024u32.to_be_bytes()).unwrap(), 1024);
+    }
     // Test fixture only: production must inject a cryptographic verifier.
     struct FixtureVerifier;
     impl DirectSessionVerifier for FixtureVerifier {
@@ -594,8 +751,10 @@ mod tests {
         let transport = IrohTransport::new(a.clone(), client_config);
         let listener = IrohListener::new(b.clone(), server_config);
         let assertion = serde_json::to_string(&claims).unwrap();
-        let (client, server) =
-            tokio::join!(transport.connect(&candidate, &assertion), listener.accept());
+        let (client, server) = tokio::join!(
+            transport.connect_session(&candidate, &assertion),
+            listener.accept()
+        );
         if _fleet_identity == 2 {
             assert!(client.is_err());
             drop(server);
@@ -624,6 +783,24 @@ mod tests {
         );
         server.send(&reply, &[]).await.unwrap();
         assert_eq!(client.receive().await.unwrap().0.producer_id, "b");
+        let client_channels = async {
+            let mut channel = client.open_channel().await.unwrap();
+            for _ in 0..3 {
+                channel.send(&message, &[0, 128, 255]).await.unwrap();
+            }
+            channel.finish().unwrap();
+            // A request FIN must not close the response direction.
+            assert_eq!(channel.receive().await.unwrap().0.producer_id, "b");
+            assert!(channel.send(&message, &[0, 128, 255]).await.is_err());
+        };
+        let server_channels = async {
+            let mut channel = server.accept_channel().await.unwrap();
+            for _ in 0..3 {
+                assert_eq!(channel.receive().await.unwrap().1, vec![0, 128, 255]);
+            }
+            channel.send(&reply, &[]).await.unwrap();
+        };
+        tokio::join!(client_channels, server_channels);
         message.destination = Some("intruder".into());
         assert!(client.send(&message, &[0, 128, 255]).await.is_err());
         #[cfg(feature = "fleet-identity")]
