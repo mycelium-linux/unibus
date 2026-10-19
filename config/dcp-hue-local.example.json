@@ -1,0 +1,21 @@
+{
+  "unibus": {
+    "installation_id": "home",
+    "producer_id": "hue-dcp-provider",
+    "hub_endpoint": "127.0.0.1:18790",
+    "token_file": "/absolute/private/hue-dcp-unibus.token",
+    "zones": ["living-room"],
+    "capabilities": ["dcp.provider"],
+    "schema_version": 2,
+    "read_timeout_ms": 500
+  },
+  "lease_ms": 30000,
+  "providers": [{
+    "provider_id": "philips-hue",
+    "node_id": "home-lighting-edge",
+    "producer_id": "hue-dcp-provider",
+    "endpoint": "http://127.0.0.1:18815",
+    "bearer_token_file": "/absolute/private/hue/provider.token",
+    "user_email": "owner@example.com"
+  }]
+}

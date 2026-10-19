@@ -1,0 +1,9 @@
+{
+  "bridge_url": "https://192.168.10.15/",
+  "application_key_file": "/Users/ajmwagar/.config/unibus/hue/application-key",
+  "bridge_certificate_file": "/Users/ajmwagar/.config/unibus/hue/bridge.pem",
+  "bridge_id": "ECB5FAFFFE134F06",
+  "provider_token_file": "/Users/ajmwagar/.config/unibus/hue/provider.token",
+  "allowed_light_ids": [],
+  "listen": "127.0.0.1:18815"
+}
