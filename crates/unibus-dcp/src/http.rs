@@ -21,6 +21,7 @@ pub struct ProviderConfig {
     pub zone: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct DcpHttpClient {
     client: Client,
     endpoint: reqwest::Url,
@@ -66,18 +67,36 @@ impl DcpHttpClient {
         })
     }
 
+    /// Bound a caller's interactive provider requests without changing other clients.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Result<Self> {
+        self.client = Client::builder()
+            .default_headers(self.headers.clone())
+            .connect_timeout(timeout.min(std::time::Duration::from_secs(2)))
+            .timeout(timeout)
+            .build()?;
+        Ok(self)
+    }
+
     pub fn discovery(&self) -> Result<Discovery> {
         self.get_json(".well-known/dcp")
     }
 
     pub fn catalog(&self) -> Result<Catalog> {
-        self.get_json("v1/decisions")
+        self.catalog_at("/v1/decisions")
+    }
+
+    pub fn catalog_at(&self, path: &str) -> Result<Catalog> {
+        self.get_json(path.trim_start_matches('/'))
     }
 
     pub fn execute(&self, request: &ExecuteRequest) -> Result<Receipt> {
+        self.execute_at("/v1/decisions/execute", request)
+    }
+
+    pub fn execute_at(&self, path: &str, request: &ExecuteRequest) -> Result<Receipt> {
         let response = self
             .client
-            .post(self.url("v1/decisions/execute")?)
+            .post(self.url(path.trim_start_matches('/'))?)
             .headers(self.headers.clone())
             .json(request)
             .send()?;
