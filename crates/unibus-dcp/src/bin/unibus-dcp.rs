@@ -147,7 +147,7 @@ fn publish(config: Config) -> Result<()> {
         .map(|provider| {
             Ok((
                 provider.provider_id.clone(),
-                DcpHttpClient::connect(provider)?.with_timeout(Duration::from_secs(3))?,
+                DcpHttpClient::connect(provider)?.with_timeout(Duration::from_secs(8))?,
             ))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -160,7 +160,8 @@ fn publish(config: Config) -> Result<()> {
             .find(|(id, _)| id == &provider.provider_id)
             .unwrap()
             .1
-            .clone();
+            .clone()
+            .with_timeout(Duration::from_secs(3))?;
         let catalog_tx = catalog_tx.clone();
         let lease_ms = config.lease_ms;
         let mut generation = 0_u64;
