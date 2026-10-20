@@ -133,6 +133,9 @@ pub(crate) fn failure(code: StatusCode, message: &str) -> Response {
 
 pub async fn serve(config: Config) -> Result<()> {
     config.validate()?;
+    if config.uploads.is_some() {
+        crate::uploads::recover(&config)?;
+    }
     let token = read_token(&config.access_token_file)?;
     let uploads = config
         .uploads
@@ -158,7 +161,7 @@ pub async fn serve(config: Config) -> Result<()> {
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(2))
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(std::time::Duration::from_secs(1800))
             .build()?,
     };
     let router = Router::new()
@@ -168,6 +171,7 @@ pub async fn serve(config: Config) -> Result<()> {
         .route("/api/nodes", get(api_nodes))
         .route("/ipfs/{cid}", get(content))
         .route("/mcp", post(mcp))
+        .route("/upload-assets/{name}", get(upload_asset))
         .route(
             "/upload",
             get(upload_page)
@@ -194,7 +198,18 @@ pub async fn serve(config: Config) -> Result<()> {
     Ok(())
 }
 
-async fn upload_page(State(app): State<App>, headers: HeaderMap) -> Response {
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct UploadPage {
+    basic: bool,
+    #[serde(rename = "folder")]
+    _folder: Option<bool>,
+}
+async fn upload_page(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(query): Query<UploadPage>,
+) -> Response {
     if !authorized(&headers, &app.token) {
         return failure(StatusCode::UNAUTHORIZED, "Authentication required");
     }
@@ -208,6 +223,43 @@ async fn upload_page(State(app): State<App>, headers: HeaderMap) -> Response {
             "Your account has read access. Upload permission is separate.",
         );
     }
+    if !query.basic {
+        if let Some(assets) = app
+            .config
+            .uploads
+            .as_ref()
+            .and_then(|c| c.browser_assets.as_ref())
+        {
+            let result = (|| -> Result<Response> {
+                let path = assets.join("index.html");
+                ensure!(
+                    std::fs::metadata(&path)?.len() <= 256 * 1024,
+                    "upload page too large"
+                );
+                let html = std::fs::read_to_string(path)?;
+                let mut random = [0u8; 24];
+                getrandom::fill(&mut random)
+                    .map_err(|e| anyhow::anyhow!("page nonce failed: {e}"))?;
+                let nonce: String = random.iter().map(|b| format!("{b:02x}")).collect();
+                let html = html
+                    .replace("<script ", &format!("<script nonce=\"{nonce}\" "))
+                    .replace("<script>", &format!("<script nonce=\"{nonce}\">"));
+                let mut reply = protected_response(Html(html).into_response());
+                reply.headers_mut().insert(header::CONTENT_SECURITY_POLICY,format!("default-src 'none'; style-src 'self'; script-src 'self' 'nonce-{nonce}' 'wasm-unsafe-eval'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'").parse()?);
+                Ok(reply)
+            })();
+            return match result {
+                Ok(reply) => reply,
+                Err(e) => {
+                    eprintln!("upload assets unavailable: {e:#}");
+                    failure(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Upload client is unavailable. Use /upload?basic=true for smaller files.",
+                    )
+                }
+            };
+        }
+    }
     let body = "<header><a class=brand href='/'>IPFS <span>Library</span></a><a href='/'>Back to files</a></header><section class=intro><p class=eyebrow>ADD TO YOUR COLLECTION</p><h1>Upload files or a folder.</h1><p>Files stay in the private swarm. Folder paths and filenames are preserved.</p></section><section class=details><h2>Upload files</h2><form method=post action='/upload' enctype='multipart/form-data'><p><label>Name (optional)<br><input name=name maxlength=240 placeholder='Use the filename'></label></p><p><input name=files type=file multiple required aria-label='Select files'></p><button>Upload files</button></form><h2>Upload a folder</h2><form method=post action='/upload?folder=true' enctype='multipart/form-data'><p><label>Folder name (optional)<br><input name=name maxlength=240 placeholder='Use the folder name'></label></p><p><input name=files type=file webkitdirectory multiple required aria-label='Select folder'></p><button>Upload folder</button></form><p>Up to 90 MiB and 256 files per browser submission. Empty folders are omitted by browser selection. Keep this page open until the upload finishes. Files save on Avery; other node badges show actual pins.</p></section>";
     let mut body = body.to_string();
     if let Some(actor) = headers.get("x-library-actor").and_then(|h| h.to_str().ok()) {
@@ -217,6 +269,69 @@ async fn upload_page(State(app): State<App>, headers: HeaderMap) -> Response {
         }
     }
     protected_response(Html(page("Upload · IPFS Library", &body)).into_response())
+}
+
+async fn upload_asset(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if !authorized(&headers, &app.token) {
+        return failure(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+    if name == "library.css" {
+        let css = include_str!("library.html")
+            .split_once("<style>")
+            .and_then(|(_, s)| s.split_once("</style>"))
+            .map(|(s, _)| s)
+            .unwrap();
+        let mut reply = protected_response(css.into_response());
+        reply.headers_mut().insert(
+            header::CONTENT_TYPE,
+            "text/css; charset=utf-8".parse().unwrap(),
+        );
+        return reply;
+    }
+    if name.len() > 128
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        || !(name.ends_with(".js") || name.ends_with(".wasm"))
+    {
+        return failure(StatusCode::NOT_FOUND, "Asset not found");
+    }
+    let Some(assets) = app
+        .config
+        .uploads
+        .as_ref()
+        .and_then(|c| c.browser_assets.as_ref())
+    else {
+        return failure(StatusCode::NOT_FOUND, "Asset not found");
+    };
+    let path = assets.join(&name);
+    match std::fs::metadata(&path).and_then(|m| {
+        if m.len() <= 4 * 1024 * 1024 {
+            std::fs::read(path)
+        } else {
+            Err(std::io::Error::other("asset exceeds limit"))
+        }
+    }) {
+        Ok(bytes) => {
+            let mut reply = protected_response(bytes.into_response());
+            reply.headers_mut().insert(
+                header::CONTENT_TYPE,
+                if name.ends_with(".wasm") {
+                    "application/wasm"
+                } else {
+                    "text/javascript; charset=utf-8"
+                }
+                .parse()
+                .unwrap(),
+            );
+            reply
+        }
+        Err(_) => failure(StatusCode::NOT_FOUND, "Asset not found"),
+    }
 }
 
 async fn api_search(
@@ -507,10 +622,10 @@ async fn content(
         Ok(arg) => arg,
         Err(_) => return failure(StatusCode::BAD_REQUEST, "Invalid folder path"),
     };
-    let Some(size) = entry.size.filter(|size| *size <= 2 * 1024 * 1024 * 1024) else {
+    let Some(size) = entry.size.filter(|size| *size <= crate::uploads::MAX_BYTES) else {
         return failure(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "File size is pending or exceeds the 2 GiB download limit",
+            "File size is pending or exceeds the 4 GiB download limit",
         );
     };
     if entry.kind != "file" {

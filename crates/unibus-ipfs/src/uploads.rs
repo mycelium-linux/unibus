@@ -23,9 +23,9 @@ use subtle::ConstantTimeEq;
 
 pub const CHUNK: usize = 8 * 1024 * 1024;
 pub const FORM_LIMIT: usize = 90 * 1024 * 1024;
-pub const MAX_BYTES: u64 = 1024 * 1024 * 1024;
-const QUOTA: u64 = 8 * MAX_BYTES;
-const RESERVE: u64 = 2 * MAX_BYTES;
+pub const MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const QUOTA: u64 = 8 * 1024 * 1024 * 1024;
+const RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +33,8 @@ pub struct Config {
     pub node: String,
     pub token_file: PathBuf,
     pub storage_path: PathBuf,
+    #[serde(default)]
+    pub browser_assets: Option<PathBuf>,
 }
 impl Config {
     pub fn validate(&self, config: &catalog::Config) -> Result<()> {
@@ -47,6 +49,10 @@ impl Config {
         ensure!(
             self.token_file != config.access_token_file,
             "upload and reader credentials must differ"
+        );
+        ensure!(
+            self.browser_assets.as_ref().is_none_or(|p| p.is_absolute()),
+            "browser assets path must be absolute"
         );
         Ok(())
     }
@@ -63,6 +69,8 @@ pub(crate) struct Uploads {
 pub struct File {
     pub path: String,
     pub size: u64,
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -109,6 +117,16 @@ impl Manifest {
         let mut paths = BTreeSet::new();
         let mut total = 0u64;
         for file in &self.files {
+            if let Some(hash) = &file.sha256 {
+                ensure!(
+                    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "invalid file SHA-256"
+                );
+            }
+            ensure!(
+                file.size <= FORM_LIMIT as u64 || file.sha256.is_some(),
+                "large resumable files require SHA-256"
+            );
             valid_path(&file.path)?;
             ensure!(
                 self.folder || !file.path.contains('/'),
@@ -116,7 +134,7 @@ impl Manifest {
             );
             ensure!(paths.insert(file.path.clone()), "duplicate path");
             total = total.checked_add(file.size).context("size overflow")?;
-            ensure!(total <= MAX_BYTES, "upload exceeds 1 GiB");
+            ensure!(total <= MAX_BYTES, "upload exceeds 4 GiB");
         }
         for path in &paths {
             let mut parent = path.as_str();
@@ -148,6 +166,133 @@ pub(crate) struct ChunkQuery {
 #[derive(Debug, Deserialize)]
 pub(crate) struct SessionQuery {
     session: String,
+    #[serde(default)]
+    background: bool,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+struct Job {
+    session: String,
+    actor: String,
+    phase: String,
+    receipt: Option<Value>,
+    error: Option<String>,
+}
+fn job_path(config: &catalog::Config) -> PathBuf {
+    config.state_dir.join("upload-job.json")
+}
+fn record_catalog(config: &catalog::Config, receipt: &Value) -> Result<()> {
+    let cid = receipt["cid"].as_str().context("missing receipt CID")?;
+    catalog::validate_cid(cid)?;
+    let name = receipt["name"].as_str().context("missing receipt name")?;
+    let node = receipt["node"].as_str().context("missing receipt node")?;
+    let refresh_lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(config.state_dir.join("refresh.lock"))?;
+    refresh_lock.lock()?;
+    let mut snapshot: catalog::Snapshot = catalog::load(&config.snapshot())?;
+    let entry = snapshot.entries.entry(cid.into()).or_default();
+    entry.cid = cid.into();
+    if !entry.nodes.iter().any(|n| n == node) {
+        entry.nodes.push(node.into());
+    }
+    if !entry.names.iter().any(|n| n == name) {
+        entry.names.insert(0, name.into());
+    }
+    entry.name_source = "pin_name".into();
+    entry.kind = if receipt["folder"] == true {
+        "directory"
+    } else {
+        "file"
+    }
+    .into();
+    if receipt["folder"] == true {
+        entry.text = receipt["paths"]
+            .as_array()
+            .context("missing folder paths")?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .take(24_000)
+            .collect();
+    }
+    entry.size = receipt["bytes"].as_u64();
+    entry.inspected = false;
+    entry.text_checked = false;
+    catalog::save(&config.snapshot(), &snapshot)
+}
+pub(crate) fn recover(config: &catalog::Config) -> Result<()> {
+    let mut job: Option<Job> = catalog::load(&job_path(config))?;
+    if let Some(job) = job
+        .as_mut()
+        .filter(|j| matches!(j.phase.as_str(), "saving" | "complete"))
+    {
+        let receipts: BTreeMap<String, Value> =
+            catalog::load(&config.state_dir.join("uploads.json"))?;
+        if let Some(receipt) = receipts.values().find(|r| r["session"] == job.session) {
+            record_catalog(config, receipt)?;
+            let pending: Option<Session> =
+                catalog::load(&config.state_dir.join("upload-session.json"))?;
+            if pending.is_some_and(|s| s.id == job.session) {
+                catalog::save(
+                    &config.state_dir.join("upload-session.json"),
+                    &Option::<Session>::None,
+                )?;
+                let path = config.state_dir.join("upload-pending");
+                if path.exists() {
+                    fs::remove_dir_all(path)?;
+                }
+            }
+            job.phase = "complete".into();
+            job.receipt = Some(receipt.clone());
+        } else {
+            job.phase = "interrupted".into();
+            job.error = Some("Saving was interrupted. Select the same files and resume.".into());
+        }
+    }
+    catalog::save(&job_path(config), &job)
+}
+fn state(config: &catalog::Config, actor: &str) -> Result<Value> {
+    let limits = json!({"max_bytes":MAX_BYTES,"chunk_bytes":CHUNK,"max_files":256});
+    let job: Option<Job> = catalog::load(&job_path(config))?;
+    let job = job.filter(|j| j.actor == actor);
+    if let Some(job) = job
+        .as_ref()
+        .filter(|j| matches!(j.phase.as_str(), "saving" | "complete"))
+    {
+        return Ok(
+            json!({"session":job.session,"phase":job.phase,"receipt":job.receipt,"error":job.error,"limits":limits}),
+        );
+    }
+    let pending: Option<Session> = catalog::load(&config.state_dir.join("upload-session.json"))?;
+    if let Some(s) =
+        pending.filter(|s| s.actor == actor && catalog::now().saturating_sub(s.updated_at) <= 3600)
+    {
+        let offsets: Vec<_> = s
+            .manifest
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                fs::metadata(config.state_dir.join("upload-pending").join(i.to_string()))
+                    .map(|m| m.len().min(f.size))
+            })
+            .collect::<std::io::Result<_>>()?;
+        let job = job.filter(|j| j.session == s.id);
+        Ok(
+            json!({"session":s.id,"name":s.manifest.name,"manifest":s.manifest,"offsets":offsets,"phase":job.as_ref().map_or("uploading",|j|j.phase.as_str()),"receipt":job.as_ref().and_then(|j|j.receipt.as_ref()),"error":job.as_ref().and_then(|j|j.error.as_ref()),"limits":limits}),
+        )
+    } else if let Some(job) = job {
+        Ok(
+            json!({"session":job.session,"phase":job.phase,"receipt":job.receipt,"error":job.error,"limits":limits}),
+        )
+    } else {
+        Ok(json!({"session":null,"phase":"idle","limits":limits}))
+    }
 }
 
 fn authority(app: &App, headers: &HeaderMap) -> Result<String> {
@@ -188,6 +333,41 @@ fn lock(config: &catalog::Config) -> Result<fs::File> {
     file.try_lock()
         .context("another upload operation is active")?;
     Ok(file)
+}
+fn used_bytes(config: &catalog::Config) -> Result<u64> {
+    let upload = config.uploads.as_ref().context("uploads disabled")?;
+    let node = config
+        .nodes
+        .iter()
+        .find(|node| node.name == upload.node)
+        .context("upload node missing")?;
+    let reply = crate::Kubo::new(&node.rpc)?.catalog_rpc(
+        "pin/ls",
+        &[("type", "recursive".into())],
+        4 * 1024 * 1024,
+    )?;
+    let pins: Value = serde_json::from_slice(&reply)?;
+    let empty = serde_json::Map::new();
+    let keys = match pins.get("Keys") {
+        Some(value) => value.as_object().context("invalid pin inventory")?,
+        None => {
+            ensure!(pins == json!({}), "invalid pin inventory");
+            &empty
+        }
+    };
+    let receipts: BTreeMap<String, Value> = catalog::load(&config.state_dir.join("uploads.json"))?;
+    receipts
+        .iter()
+        .filter(|(cid, _)| keys.contains_key(*cid))
+        .try_fold(0u64, |total, (_, receipt)| {
+            total
+                .checked_add(
+                    receipt["bytes"]
+                        .as_u64()
+                        .context("invalid upload receipt size")?,
+                )
+                .context("upload usage overflow")
+        })
 }
 fn session(config: &catalog::Config, id: &str, actor: &str) -> Result<Session> {
     let session: Option<Session> = catalog::load(&config.state_dir.join("upload-session.json"))?;
@@ -251,10 +431,7 @@ pub(crate) async fn begin(
             receipts.len() < catalog::MAX_ENTRIES,
             "upload catalog is full"
         );
-        let used: u64 = receipts
-            .values()
-            .map(|r| r["bytes"].as_u64().unwrap_or(0))
-            .sum();
+        let used = used_bytes(&app.config)?;
         ensure!(
             used.saturating_add(total) <= QUOTA,
             "8 GiB library upload allowance exhausted"
@@ -275,6 +452,7 @@ pub(crate) async fn begin(
         getrandom::fill(&mut random)
             .map_err(|e| anyhow::anyhow!("session randomness failed: {e}"))?;
         let id: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        catalog::save(&job_path(&app.config), &Option::<Job>::None)?;
         catalog::save(
             &app.config.state_dir.join("upload-session.json"),
             &Some(Session {
@@ -365,11 +543,8 @@ pub(crate) async fn status(State(app): State<App>, headers: HeaderMap) -> Respon
         Ok(a) => a,
         Err(_) => return failure(StatusCode::FORBIDDEN, "Upload permission required"),
     };
-    match catalog::load::<Option<Session>>(&app.config.state_dir.join("upload-session.json")) {
-        Ok(Some(s)) if s.actor == actor && catalog::now().saturating_sub(s.updated_at) <= 3600 => {
-            protected_response(Json(json!({"session":s.id,"name":s.manifest.name})).into_response())
-        }
-        Ok(_) => protected_response(Json(json!({"session":null})).into_response()),
+    match state(&app.config, &actor) {
+        Ok(value) => protected_response(Json(value).into_response()),
         Err(e) => error(e),
     }
 }
@@ -385,6 +560,10 @@ pub(crate) async fn cancel(
     let result = (|| -> Result<()> {
         let _lock = lock(&app.config)?;
         session(&app.config, &query.session, &actor)?;
+        let job: Option<Job> = catalog::load(&job_path(&app.config))?;
+        if job.is_some_and(|j| j.session == query.session && j.actor == actor) {
+            catalog::save(&job_path(&app.config), &Option::<Job>::None)?;
+        }
         catalog::save(
             &app.config.state_dir.join("upload-session.json"),
             &Option::<Session>::None,
@@ -407,6 +586,105 @@ pub(crate) async fn commit(
         Ok(a) => a,
         Err(_) => return failure(StatusCode::FORBIDDEN, "Upload permission required"),
     };
+    if query.background {
+        let existing: Option<Job> = match catalog::load(&job_path(&app.config)) {
+            Ok(job) => job,
+            Err(e) => return error(e),
+        };
+        if let Some(job) = existing.filter(|j| j.session == query.session && j.actor == actor) {
+            if job.phase == "saving" {
+                return protected_response(
+                    (
+                        StatusCode::ACCEPTED,
+                        Json(json!({"session":query.session,"phase":"saving"})),
+                    )
+                        .into_response(),
+                );
+            }
+            if job.phase == "complete" {
+                return protected_response(Json(job.receipt).into_response());
+            }
+        }
+        let start = (|| -> Result<bool> {
+            let _lock = lock(&app.config)?;
+            session(&app.config, &query.session, &actor)?;
+            let job: Option<Job> = catalog::load(&job_path(&app.config))?;
+            if job.is_some_and(|j| {
+                j.session == query.session && j.actor == actor && j.phase == "saving"
+            }) {
+                return Ok(false);
+            }
+            catalog::save(
+                &job_path(&app.config),
+                &Some(Job {
+                    session: query.session.clone(),
+                    actor: actor.clone(),
+                    phase: "saving".into(),
+                    ..Job::default()
+                }),
+            )?;
+            Ok(true)
+        })();
+        match start {
+            Err(e) => return error(e),
+            Ok(true) => {
+                let worker = app.clone();
+                let id = query.session.clone();
+                let who = actor.clone();
+                tokio::spawn(async move {
+                    let result = import(&worker, &id, &who).await;
+                    let job = match result {
+                        Ok(value) => Job {
+                            session: id,
+                            actor: who,
+                            phase: "complete".into(),
+                            receipt: Some(value),
+                            error: None,
+                        },
+                        Err(e) => {
+                            eprintln!("IPFS background import failed: {e:#}");
+                            Job {
+                                session: id,
+                                actor: who,
+                                phase: "failed".into(),
+                                receipt: None,
+                                error: Some(e.to_string()),
+                            }
+                        }
+                    };
+                    let config = worker.config.clone();
+                    if let Err(e) = tokio::task::spawn_blocking(move || -> Result<()> {
+                        let guard = fs::OpenOptions::new()
+                            .create(true)
+                            .truncate(false)
+                            .write(true)
+                            .open(config.state_dir.join("upload.lock"))?;
+                        guard.lock()?;
+                        let current: Option<Job> = catalog::load(&job_path(&config))?;
+                        if current.is_some_and(|j| {
+                            j.session == job.session && j.actor == job.actor && j.phase == "saving"
+                        }) {
+                            catalog::save(&job_path(&config), &Some(job))?;
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.into()))
+                    {
+                        eprintln!("IPFS import status persistence failed: {e:#}");
+                    }
+                });
+            }
+            Ok(false) => {}
+        }
+        return protected_response(
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({"session":query.session,"phase":"saving"})),
+            )
+                .into_response(),
+        );
+    }
     match import(&app, &query.session, &actor).await {
         Ok(value) => protected_response(Json(value).into_response()),
         Err(e) => error(e),
@@ -434,7 +712,9 @@ pub(crate) async fn native(
         let upload = app.uploads.as_ref().context("uploads disabled")?;
         ensure!(fs2::available_space(&upload.config.storage_path)? >= RESERVE + 2 * FORM_LIMIT as u64,"insufficient storage for a browser upload");
         let receipts: BTreeMap<String,Value> = catalog::load(&app.config.state_dir.join("uploads.json"))?;
-        let used:u64 = receipts.values().map(|r|r["bytes"].as_u64().unwrap_or(0)).sum();
+        ensure!(receipts.len()<catalog::MAX_ENTRIES,"upload catalog is full");
+        let usage_config=app.config.clone();
+        let used=tokio::task::spawn_blocking(move||used_bytes(&usage_config)).await??;
         let pending = app.config.state_dir.join("upload-pending");
         if pending.exists(){fs::remove_dir_all(&pending)?;}
         fs::create_dir(&pending)?;
@@ -469,7 +749,7 @@ pub(crate) async fn native(
                 size+=chunk.len() as u64;
             }
             file.sync_all().await?;
-            files.push(File{path,size});
+            files.push(File{path,size,sha256:None});
         }
         ensure!(!files.is_empty(),"select at least one file");
         let folder=query.folder||files.len()>1;
@@ -509,10 +789,41 @@ async fn small_json(mut reply: reqwest::Response) -> Result<Value> {
     }
     Ok(serde_json::from_slice(&bytes)?)
 }
+fn verify_files(verify_config: &catalog::Config, verify_manifest: &Manifest) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    for (i, spec) in verify_manifest.files.iter().enumerate() {
+        let mut file = fs::File::open(
+            verify_config
+                .state_dir
+                .join("upload-pending")
+                .join(i.to_string()),
+        )?;
+        ensure!(file.metadata()?.len() == spec.size, "upload is incomplete");
+        if let Some(expected) = &spec.sha256 {
+            let mut hash = Sha256::new();
+            let mut buffer = vec![0u8; 1024 * 1024];
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                hash.update(&buffer[..count]);
+            }
+            ensure!(
+                format!("{:x}", hash.finalize()) == expected.to_ascii_lowercase(),
+                "uploaded bytes do not match file SHA-256; cancel and retry"
+            );
+        }
+    }
+    Ok(())
+}
 async fn import(app: &App, id: &str, actor: &str) -> Result<Value> {
     let _lock = lock(&app.config)?;
     let session = session(&app.config, id, actor)?;
     let total = session.manifest.validate()?;
+    let verify_config = app.config.clone();
+    let verify_manifest = session.manifest.clone();
+    tokio::task::spawn_blocking(move || verify_files(&verify_config, &verify_manifest)).await??;
     let upload = app.uploads.as_ref().context("uploads disabled")?;
     let node = app
         .config
@@ -619,47 +930,25 @@ async fn import(app: &App, id: &str, actor: &str) -> Result<Value> {
     );
     let mut receipts: BTreeMap<String, Value> =
         catalog::load(&app.config.state_dir.join("uploads.json"))?;
-    let receipt = json!({"cid":cid,"name":session.manifest.name,"bytes":total,"files":session.manifest.files.len(),"paths":session.manifest.files.iter().map(|file|&file.path).collect::<Vec<_>>(),"folder":session.manifest.folder,"node":node.name,"actor":actor,"created_at":catalog::now()});
+    let receipt = json!({"cid":cid,"name":session.manifest.name,"bytes":total,"files":session.manifest.files.len(),"paths":session.manifest.files.iter().map(|file|&file.path).collect::<Vec<_>>(),"sha256":session.manifest.files.iter().map(|file|&file.sha256).collect::<Vec<_>>(),"folder":session.manifest.folder,"node":node.name,"actor":actor,"session":id,"created_at":catalog::now()});
     receipts.insert(cid.into(), receipt.clone());
     catalog::save(&app.config.state_dir.join("uploads.json"), &receipts)?;
-    // Serialize with the scanner. Pin name remains recoverable even if this write fails.
     let config = app.config.clone();
-    let cid = cid.to_owned();
-    let node_name = node.name.clone();
-    let manifest = session.manifest.clone();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let refresh_lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(config.state_dir.join("refresh.lock"))?;
-        refresh_lock.lock()?;
-        let mut snapshot: catalog::Snapshot = catalog::load(&config.snapshot())?;
-        let entry = snapshot.entries.entry(cid.clone()).or_default();
-        entry.cid = cid;
-        if !entry.nodes.contains(&node_name) {
-            entry.nodes.push(node_name);
-        }
-        entry.names.insert(0, manifest.name);
-        entry.name_source = "pin_name".into();
-        entry.kind = if manifest.folder { "directory" } else { "file" }.into();
-        if manifest.folder {
-            entry.text = manifest
-                .files
-                .iter()
-                .map(|file| file.path.as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
-                .chars()
-                .take(24_000)
-                .collect();
-        }
-        entry.size = Some(total);
-        entry.inspected = false;
-        entry.text_checked = false;
-        catalog::save(&config.snapshot(), &snapshot)
-    })
-    .await??;
+    let saved_receipt = receipt.clone();
+    tokio::task::spawn_blocking(move || record_catalog(&config, &saved_receipt)).await??;
+    let job: Option<Job> = catalog::load(&job_path(&app.config))?;
+    if job.is_some_and(|j| j.session == id && j.actor == actor && j.phase == "saving") {
+        catalog::save(
+            &job_path(&app.config),
+            &Some(Job {
+                session: id.into(),
+                actor: actor.into(),
+                phase: "complete".into(),
+                receipt: Some(receipt.clone()),
+                error: None,
+            }),
+        )?;
+    }
     catalog::save(
         &app.config.state_dir.join("upload-session.json"),
         &Option::<Session>::None,
@@ -684,17 +973,29 @@ mod tests {
                 File {
                     path: "a".into(),
                     size: 3,
+                    sha256: None,
                 },
                 File {
                     path: "a/b".into(),
                     size: 2,
+                    sha256: None,
                 },
             ],
         };
         assert!(manifest.validate().is_err());
         manifest.files = vec![File {
+            path: "large.bin".into(),
+            size: MAX_BYTES,
+            sha256: Some("0".repeat(64)),
+        }];
+        assert_eq!(manifest.validate().unwrap(), MAX_BYTES);
+        manifest.files[0].sha256 = None;
+        assert!(manifest.validate().is_err());
+        assert_eq!(QUOTA, 8 * 1024 * 1024 * 1024);
+        manifest.files = vec![File {
             path: "a".into(),
             size: MAX_BYTES + 1,
+            sha256: None,
         }];
         assert!(manifest.validate().is_err());
     }
@@ -724,6 +1025,7 @@ mod tests {
                     files: vec![File {
                         path: "test.txt".into(),
                         size: 4,
+                        sha256: None,
                     }],
                 },
             }),
@@ -769,5 +1071,44 @@ mod tests {
             fs::read(dir.path().join("upload-pending/0")).unwrap(),
             b"abcd"
         );
+        assert_eq!(state(&config, "owner").unwrap()["offsets"], json!([4]));
+        assert!(state(&config, "other").unwrap()["session"].is_null());
+        let mut saved = session(&config, "abc", "owner").unwrap();
+        use sha2::{Digest, Sha256};
+        saved.manifest.files[0].sha256 = Some(format!("{:x}", Sha256::digest(b"abcd")));
+        assert!(verify_files(&config, &saved.manifest).is_ok());
+        fs::write(dir.path().join("upload-pending/0"), b"abce").unwrap();
+        assert!(verify_files(&config, &saved.manifest).is_err());
+        catalog::save(
+            &job_path(&config),
+            &Some(Job {
+                session: "abc".into(),
+                actor: "owner".into(),
+                phase: "saving".into(),
+                ..Job::default()
+            }),
+        )
+        .unwrap();
+        recover(&config).unwrap();
+        let job: Option<Job> = catalog::load(&job_path(&config)).unwrap();
+        assert_eq!(job.unwrap().phase, "interrupted");
+        catalog::save(
+            &config.state_dir.join("uploads.json"),
+            &json!({"cid":{"session":"abc","cid":"bafkreid4xhlzm7ppdjvigsyevb7grissmrmx4kx3wgd6m4of7mifopcnc4","name":"Recovered file","node":"one","bytes":4,"folder":false}}),
+        )
+        .unwrap();
+        catalog::save(
+            &job_path(&config),
+            &Some(Job {
+                session: "abc".into(),
+                actor: "owner".into(),
+                phase: "saving".into(),
+                ..Job::default()
+            }),
+        )
+        .unwrap();
+        recover(&config).unwrap();
+        let job: Option<Job> = catalog::load(&job_path(&config)).unwrap();
+        assert_eq!(job.unwrap().phase, "complete");
     }
 }

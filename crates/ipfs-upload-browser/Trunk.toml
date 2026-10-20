@@ -1,0 +1,6 @@
+[build]
+public_url = "/upload-assets/"
+filehash = true
+
+[tools]
+wasm_bindgen = "0.2.129"

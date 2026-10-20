@@ -45,9 +45,9 @@ a 4 KiB prefix. JSON searchable text is capped at 24,000 characters. Unsupported
 large, or pending files remain searchable by their CID and known labels.
 
 Browser routes are `/`, `/files/{cid}`, `/api/search`, `/api/nodes`, and
-`/ipfs/{cid}`. Files must be cataloged and have a known size up to 2 GiB.
+`/ipfs/{cid}`. Files must be cataloged and have a known size up to 4 GiB.
 Downloads stream from observed replicas with two concurrent streams and a
-five-minute timeout. A single byte range supports PDF readers and resuming;
+30-minute timeout. A single byte range supports PDF readers and resuming;
 an unmatched `If-Range` returns the complete representation. Streaming failures
 abort the response; they do not silently produce a truncated successful file.
 Active formats download as attachments. Content uses a separate origin, a
@@ -75,27 +75,46 @@ supplies the write token and authenticated actor only after checking both the
 read grant and `web:ipfs-library:upload`. It also requires the exact primary
 browser origin. No write credential is supplied to the MCP provider.
 
-`/upload` provides native HTML forms for files and folders, up to 90 MiB total
-and 256 files per submission. Chromium sends relative folder paths with native
+With `uploads.browser_assets` set to an absolute directory containing a built
+`crates/ipfs-upload-browser` bundle, `/upload` serves the Rust/WebAssembly client.
+It supports up to 4 GiB total and 256 files per upload, folder paths, progress,
+pause, checked retries, and resume after reselecting the same files. Limits come
+from the server. It hashes files in bounded parts before admission and uploads
+only missing parts. Generated JavaScript comes from Trunk/wasm-bindgen; browser
+application logic is Rust. See that crate's README for the build/install contract.
+Assets require reader authorization; page scripts receive a fresh CSP nonce.
+
+`/upload?basic=true` retains native HTML forms, up to 90 MiB total and 256 files
+per submission. It is also the default when browser assets are not configured.
+Chromium sends relative folder paths with native
 form uploads; see its [FormData implementation](https://chromium.googlesource.com/chromium/src/+/HEAD/third_party/blink/renderer/core/html/forms/form_data.cc).
 Browsers that omit folder paths get an explicit error instead of flattening the
-tree. Empty directories are omitted by browser selection. No first-party
-JavaScript is used. Progress and larger browser submissions need an optional
-client for the chunked API.
+tree. Empty directories are omitted by browser selection in both uploaders.
 
 The authenticated chunk API accepts `/api/upload/begin` with
-`{name,folder,files:[{path,size}]}`, then `/chunk?session=ID&file=N&offset=BYTES`,
-then `/commit?session=ID`. `/status` and `/cancel?session=ID` manage the pending
-upload. All use POST. Chunks are at most 8 MiB; imports are at most 1 GiB and
+`{name,folder,files:[{path,size,sha256}]}`, then `/chunk?session=ID&file=N&offset=BYTES`,
+then `/commit?session=ID&background=true`. `/status` and `/cancel?session=ID` manage
+the pending upload. All use POST. SHA-256 is 64 hexadecimal characters, optional
+only for files at most 90 MiB; the browser supplies it for every file. The server
+checks staged size and checksum before Kubo import. Chunks are at most 8 MiB;
+imports are at most 4 GiB total and
 256 files. One active session is owned by one authenticated actor. Exact chunk
 retries are checked against stored bytes; wrong offsets or different replay data
 fail. Repeating begin with the same manifest resumes the saved session.
+Status returns saved per-file byte offsets and the upload limits. Background
+commit returns 202, is idempotent, and persists `saving`, `complete`, or `failed`
+status for polling. Startup reconciles durable receipts into the catalog;
+interrupted saves without a receipt retain staging for a same-file retry.
+The synchronous `/commit?session=ID` operation remains available for API clients.
 Sessions expire after one hour without writes. A subsequent begin removes stale
 staging. Numeric staging filenames keep user paths out of local filesystem writes.
 Traversal, duplicate paths, and file/directory conflicts are rejected.
 
-Admission keeps 2 GiB free plus staging and imported bytes. The upload ledger
-limits total logical imported bytes to 8 GiB. This is separate from Kubo's soft
+Admission keeps 2 GiB free plus staging and imported bytes. Logical uploaded
+bytes in currently recursively pinned receipt roots are limited to 8 GiB;
+historical receipts for unpinned roots do not consume this allowance. Usage is
+derived from a fresh Kubo pin inventory; an inventory failure denies admission.
+The allowance and reserve are independent of the maximum upload size and Kubo's soft
 GC target. Imported data streams through Kubo's own multipart
 [`add` API](https://docs.ipfs.tech/reference/kubo/rpc/#api-v0-add).
 Completed roots are pinned with their name; root type, file size and recursive

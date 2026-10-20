@@ -1,0 +1,14 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Upload · IPFS Library</title><link rel="stylesheet" href="/upload-assets/library.css"><link data-trunk rel="rust" data-wasm-opt="0"></head><body><main>
+<header><a class="brand" href="/">IPFS <span>Library</span></a><a href="/">Back to files</a></header>
+<section class="intro"><p class="eyebrow">ADD TO YOUR COLLECTION</p><h1>Upload files or a folder.</h1><p>Large files upload in small parts. Pause and resume without starting over.</p></section>
+<form id="upload-form" class="details">
+<p><label for="files">Choose files</label><br><input id="files" type="file" multiple></p>
+<p><label for="folder">Or choose a folder</label><br><input id="folder" type="file" webkitdirectory multiple></p>
+<p><label for="name">Name (optional)</label><br><input id="name" maxlength="240" placeholder="Use the file or folder name"></p>
+<p id="limits">Loading upload limits…</p><p><button id="start" type="submit" disabled>Upload / resume</button> <button id="pause" type="button" disabled>Pause</button> <button id="cancel" type="button" disabled>Cancel saved upload</button></p>
+<p><progress id="progress" max="100" value="0" aria-label="Upload progress"></progress></p>
+<p id="status" role="status" aria-live="polite">Starting uploader…</p>
+<p id="result"></p><p>Resuming after a reload requires selecting the same files. Files are checked before upload and before saving. Empty folders are omitted by browser selection.</p>
+<p><a href="/upload?basic=true">Use the basic uploader</a></p>
+<noscript>The large-file uploader needs WebAssembly and scripting enabled. Use the basic uploader for smaller files.</noscript>
+</form></main></body></html>
