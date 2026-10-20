@@ -9,15 +9,17 @@ description = "Bounded CID-only retrieval through a local Kubo node"
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["multipart", "stream"] }
+fs2 = "0.4"
+tokio-util = { version = "0.7", features = ["io"] }
 futures-util = "0.3"
 unibus.workspace = true
 cid = "0.11"
 tempfile.workspace = true
 getrandom.workspace = true
 subtle.workspace = true
-axum = "0.8"
-tokio = { workspace = true, features = ["net", "time"] }
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { workspace = true, features = ["net", "time", "fs", "io-util"] }
 
 [[bin]]
 name = "unibus-ipfs-library"

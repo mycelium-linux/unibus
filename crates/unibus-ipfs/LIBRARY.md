@@ -2,8 +2,9 @@
 
 The `unibus-ipfs-library` binary adds a read-only catalog, browser, and MCP view
 to the existing local Kubo client. Kubo remains the block, pin, and swarm owner.
-The catalog observes direct/recursive pins; it does not replicate, unpin, upload,
-or expose Kubo administration. MFS can be empty while these pins consume storage.
+The catalog observes direct/recursive pins. Optional uploads import and pin files
+on one explicitly configured node. It does not replicate, unpin, or expose Kubo
+administration. MFS can be empty while these pins consume storage.
 
 Build with `cargo build -p unibus-ipfs --bin unibus-ipfs-library`. Install
 `poppler-utils` and GNU `timeout` on the scanner host for optional PDF extraction.
@@ -64,6 +65,49 @@ The stdio adapter accepts newline-delimited JSON-RPC with 64 KiB request and
 forward to the catalog. It reads credentials from a private file and writes
 only protocol replies to stdout. Register it using the existing Unibus MCP
 publisher rather than adding another registry.
+
+## Uploads and folders
+
+Set optional `uploads` configuration with a configured node name, a distinct
+private write token file, and the absolute path of that node's local Kubo storage
+filesystem. The reader token cannot authorize imports. The Mycelium adapter
+supplies the write token and authenticated actor only after checking both the
+read grant and `web:ipfs-library:upload`. It also requires the exact primary
+browser origin. No write credential is supplied to the MCP provider.
+
+`/upload` provides native HTML forms for files and folders, up to 90 MiB total
+and 256 files per submission. Chromium sends relative folder paths with native
+form uploads; see its [FormData implementation](https://chromium.googlesource.com/chromium/src/+/HEAD/third_party/blink/renderer/core/html/forms/form_data.cc).
+Browsers that omit folder paths get an explicit error instead of flattening the
+tree. Empty directories are omitted by browser selection. No first-party
+JavaScript is used. Progress and larger browser submissions need an optional
+client for the chunked API.
+
+The authenticated chunk API accepts `/api/upload/begin` with
+`{name,folder,files:[{path,size}]}`, then `/chunk?session=ID&file=N&offset=BYTES`,
+then `/commit?session=ID`. `/status` and `/cancel?session=ID` manage the pending
+upload. All use POST. Chunks are at most 8 MiB; imports are at most 1 GiB and
+256 files. One active session is owned by one authenticated actor. Exact chunk
+retries are checked against stored bytes; wrong offsets or different replay data
+fail. Repeating begin with the same manifest resumes the saved session.
+Sessions expire after one hour without writes. A subsequent begin removes stale
+staging. Numeric staging filenames keep user paths out of local filesystem writes.
+Traversal, duplicate paths, and file/directory conflicts are rejected.
+
+Admission keeps 2 GiB free plus staging and imported bytes. The upload ledger
+limits total logical imported bytes to 8 GiB. This is separate from Kubo's soft
+GC target. Imported data streams through Kubo's own multipart
+[`add` API](https://docs.ipfs.tech/reference/kubo/rpc/#api-v0-add).
+Completed roots are pinned with their name; root type, file size and recursive
+pin are verified before reporting success. A durable receipt records the actor,
+paths and CID. A pin that succeeds before a later catalog/receipt error is kept;
+recovery must not unpin user data. Cancel removes staging, not existing pins.
+
+The catalog is updated under the scanner lock. Folder paths are searchable as
+bounded metadata. Folder detail pages list descendants; opening or downloading
+a child remains anchored to the cataloged root. CIDs outside the collection and
+traversal paths cannot be used to reach arbitrary content. Uploaded roots are
+stored on the selected node only; this is not a replication policy.
 
 ## Verification
 

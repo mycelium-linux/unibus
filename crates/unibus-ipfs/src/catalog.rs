@@ -32,6 +32,8 @@ pub struct Config {
     pub nodes: Vec<Node>,
     pub gateway: String,
     pub public_url: String,
+    #[serde(default)]
+    pub uploads: Option<crate::uploads::Config>,
 }
 
 impl Config {
@@ -85,6 +87,9 @@ impl Config {
             public.origin() != gateway.origin(),
             "content must use a separate origin"
         );
+        if let Some(upload) = &self.uploads {
+            upload.validate(self)?;
+        }
         Ok(())
     }
     pub fn snapshot(&self) -> PathBuf {
@@ -812,6 +817,7 @@ mod tests {
             }],
             gateway: "https://content.example".into(),
             public_url: "https://library.example".into(),
+            uploads: None,
         };
         let mut s = Snapshot::default();
         apply_inventory(

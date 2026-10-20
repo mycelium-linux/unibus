@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::{io::Read, time::Duration};
 
 pub mod catalog;
+mod folders;
 pub mod library;
+pub mod uploads;
 
 pub const FETCH: &str = "unibus.ipfs.fetch.v1";
 pub const CONTENT: &str = "unibus.ipfs.content.v1";

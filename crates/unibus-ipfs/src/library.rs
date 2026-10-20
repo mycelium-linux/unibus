@@ -14,11 +14,12 @@ use std::{fmt::Write as _, sync::Arc};
 use subtle::ConstantTimeEq;
 
 #[derive(Clone)]
-struct App {
-    config: Config,
+pub(crate) struct App {
+    pub(crate) config: Config,
     token: Arc<str>,
     downloads: Arc<tokio::sync::Semaphore>,
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
+    pub(crate) uploads: Option<crate::uploads::Uploads>,
 }
 
 #[derive(Default, Deserialize)]
@@ -107,7 +108,7 @@ fn authorized(headers: &HeaderMap, expected: &str) -> bool {
     value.is_some_and(|value| value.as_bytes().ct_eq(expected.as_bytes()).into())
 }
 
-fn protected_response(response: Response) -> Response {
+pub(crate) fn protected_response(response: Response) -> Response {
     let mut response = response;
     for (key, value) in [
         ("cache-control", "no-store"),
@@ -126,17 +127,33 @@ fn protected_response(response: Response) -> Response {
     response
 }
 
-fn failure(code: StatusCode, message: &str) -> Response {
+pub(crate) fn failure(code: StatusCode, message: &str) -> Response {
     protected_response((code, message.to_string()).into_response())
 }
 
 pub async fn serve(config: Config) -> Result<()> {
     config.validate()?;
     let token = read_token(&config.access_token_file)?;
+    let uploads = config
+        .uploads
+        .as_ref()
+        .map(|upload| -> Result<_> {
+            let upload_token = read_token(&upload.token_file)?;
+            ensure!(
+                upload_token != token,
+                "upload credential must differ from reader credential"
+            );
+            Ok(crate::uploads::Uploads {
+                config: upload.clone(),
+                token: upload_token,
+            })
+        })
+        .transpose()?;
     let app = App {
         config: config.clone(),
         token: token.into(),
         downloads: Arc::new(tokio::sync::Semaphore::new(2)),
+        uploads,
         http: reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -151,6 +168,20 @@ pub async fn serve(config: Config) -> Result<()> {
         .route("/api/nodes", get(api_nodes))
         .route("/ipfs/{cid}", get(content))
         .route("/mcp", post(mcp))
+        .route(
+            "/upload",
+            get(upload_page)
+                .post(crate::uploads::native)
+                .layer(DefaultBodyLimit::max(crate::uploads::FORM_LIMIT)),
+        )
+        .route("/api/upload/begin", post(crate::uploads::begin))
+        .route("/api/upload/commit", post(crate::uploads::commit))
+        .route("/api/upload/cancel", post(crate::uploads::cancel))
+        .route("/api/upload/status", post(crate::uploads::status))
+        .route(
+            "/api/upload/chunk",
+            post(crate::uploads::chunk).layer(DefaultBodyLimit::max(crate::uploads::CHUNK)),
+        )
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(app);
@@ -161,6 +192,31 @@ pub async fn serve(config: Config) -> Result<()> {
     );
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+async fn upload_page(State(app): State<App>, headers: HeaderMap) -> Response {
+    if !authorized(&headers, &app.token) {
+        return failure(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+    if app.uploads.is_none()
+        || !headers
+            .get("x-library-can-upload")
+            .is_some_and(|h| h == "true")
+    {
+        return failure(
+            StatusCode::FORBIDDEN,
+            "Your account has read access. Upload permission is separate.",
+        );
+    }
+    let body = "<header><a class=brand href='/'>IPFS <span>Library</span></a><a href='/'>Back to files</a></header><section class=intro><p class=eyebrow>ADD TO YOUR COLLECTION</p><h1>Upload files or a folder.</h1><p>Files stay in the private swarm. Folder paths and filenames are preserved.</p></section><section class=details><h2>Upload files</h2><form method=post action='/upload' enctype='multipart/form-data'><p><label>Name (optional)<br><input name=name maxlength=240 placeholder='Use the filename'></label></p><p><input name=files type=file multiple required aria-label='Select files'></p><button>Upload files</button></form><h2>Upload a folder</h2><form method=post action='/upload?folder=true' enctype='multipart/form-data'><p><label>Folder name (optional)<br><input name=name maxlength=240 placeholder='Use the folder name'></label></p><p><input name=files type=file webkitdirectory multiple required aria-label='Select folder'></p><button>Upload folder</button></form><p>Up to 90 MiB and 256 files per browser submission. Empty folders are omitted by browser selection. Keep this page open until the upload finishes. Files save on Avery; other node badges show actual pins.</p></section>";
+    let mut body = body.to_string();
+    if let Some(actor) = headers.get("x-library-actor").and_then(|h| h.to_str().ok()) {
+        match crate::uploads::pending_form(&app.config, actor) {
+            Ok(markup) => body.push_str(&markup),
+            Err(e) => return failure(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+        }
+    }
+    protected_response(Html(page("Upload · IPFS Library", &body)).into_response())
 }
 
 async fn api_search(
@@ -213,6 +269,10 @@ async fn index(
             return failure(StatusCode::SERVICE_UNAVAILABLE, "Catalog unavailable");
         }
     };
+    let can_upload = app.uploads.is_some()
+        && headers
+            .get("x-library-can-upload")
+            .is_some_and(|h| h == "true");
     let result = match search(&snapshot, &query) {
         Ok(value) => value,
         Err(_) => return failure(StatusCode::BAD_REQUEST, "Invalid search"),
@@ -224,6 +284,12 @@ async fn index(
         .filter(|entry| !entry.inspected || !entry.text_checked)
         .count();
     write!(body, "<header><a class=brand href='/'>IPFS <span>Library</span></a><span class=private>Private collection</span></header><section class=intro><p class=eyebrow>YOUR FILES, ACROSS YOUR NODES</p><h1>A place to find things.</h1><p>Browse your collection or search names, titles and indexed document text.</p></section><section class=nodes>").unwrap();
+    if can_upload {
+        body = body.replace(
+            "</header>",
+            "<a class=open href='/upload'>Upload files or a folder ↑</a></header>",
+        );
+    }
     for node in &app.config.nodes {
         let state = snapshot.nodes.get(&node.name);
         let online =
@@ -296,7 +362,17 @@ async fn index(
     protected_response(Html(page("IPFS Library", &body)).into_response())
 }
 
-async fn detail(State(app): State<App>, headers: HeaderMap, Path(cid): Path<String>) -> Response {
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct Browse {
+    path: String,
+}
+async fn detail(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(cid): Path<String>,
+    Query(query): Query<Browse>,
+) -> Response {
     if !authorized(&headers, &app.token) {
         return failure(StatusCode::UNAUTHORIZED, "Authentication required");
     }
@@ -310,14 +386,37 @@ async fn detail(State(app): State<App>, headers: HeaderMap, Path(cid): Path<Stri
     let Some(entry) = snapshot.entries.get(&cid) else {
         return failure(StatusCode::NOT_FOUND, "File is not in this collection");
     };
+    let child;
+    let entry = if query.path.is_empty() {
+        entry
+    } else {
+        child = match crate::folders::resolve(&app, entry, &query.path).await {
+            Ok(e) => e,
+            Err(e) => return failure(StatusCode::NOT_FOUND, &e.to_string()),
+        };
+        &child
+    };
+    if entry.kind == "directory" {
+        return match crate::folders::browse(&app, entry, &query.path).await {
+            Ok(reply) => reply,
+            Err(e) => failure(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+        };
+    }
+    let path_url = |download| {
+        let mut url = reqwest::Url::parse(&content_url(&app.config, entry, download)).unwrap();
+        if !query.path.is_empty() {
+            url.query_pairs_mut().append_pair("path", &query.path);
+        }
+        url.to_string()
+    };
     let mut body = format!(
         "<header><a class=brand href='/'>IPFS <span>Library</span></a></header><a href='/'>← Back to files</a><section class=intro><p class=eyebrow>{}</p><h1>{}</h1><p>{} · {}</p></section><p class=actions><a class=open href='{}' target=_blank rel=noopener>Open file ↗</a> <a class=open href='{}'>Download</a></p><section class=details><h2>Stored on</h2><p>{}</p><h2>Content address</h2><code>{}</code><h2>Name source</h2><p>{}</p><h2>Indexed text</h2><p class=muted>This is a bounded extraction, not a complete full-text index.</p><pre>{}</pre></section>",
         escape(&entry.mime),
         escape(&entry.display_name()),
         escape(&entry.kind),
         bytes(entry.size),
-        escape(&content_url(&app.config, entry, false)),
-        escape(&content_url(&app.config, entry, true)),
+        escape(&path_url(false)),
+        escape(&path_url(true)),
         escape(&entry.nodes.join(", ")),
         entry.cid,
         escape(&entry.name_source),
@@ -366,6 +465,7 @@ fn download_name(entry: &Entry) -> String {
 struct Download {
     filename: Option<String>,
     download: bool,
+    path: String,
 }
 
 async fn content(
@@ -393,6 +493,20 @@ async fn content(
     let Some(entry) = snapshot.entries.get(&cid) else {
         return failure(StatusCode::NOT_FOUND, "File not in collection");
     };
+    let child;
+    let entry = if query.path.is_empty() {
+        entry
+    } else {
+        child = match crate::folders::resolve(&app, entry, &query.path).await {
+            Ok(e) => e,
+            Err(e) => return failure(StatusCode::NOT_FOUND, &e.to_string()),
+        };
+        &child
+    };
+    let arg = match crate::folders::ipfs_path(&cid, &query.path) {
+        Ok(arg) => arg,
+        Err(_) => return failure(StatusCode::BAD_REQUEST, "Invalid folder path"),
+    };
     let Some(size) = entry.size.filter(|size| *size <= 2 * 1024 * 1024 * 1024) else {
         return failure(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -402,7 +516,18 @@ async fn content(
     if entry.kind != "file" {
         return failure(StatusCode::BAD_REQUEST, "Select an individual file");
     }
-    let etag = format!("\"{cid}\"");
+    let etag = if query.path.is_empty() {
+        format!("\"{cid}\"")
+    } else {
+        format!(
+            "\"{cid}:{}\"",
+            query
+                .path
+                .bytes()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        )
+    };
     let range_header = headers
         .get(header::RANGE)
         .and_then(|h| h.to_str().ok())
@@ -434,7 +559,7 @@ async fn content(
             .http
             .post(format!("{}/api/v0/cat", node.rpc.trim_end_matches('/')))
             .query(&[
-                ("arg", cid.clone()),
+                ("arg", arg.clone()),
                 ("offset", offset.to_string()),
                 ("length", length.to_string()),
             ])
@@ -612,8 +737,18 @@ pub fn mcp_result(config: &Config, request: &Value) -> Value {
                         json!({"cid":entry.cid,"name":entry.display_name(),"text":entry.text.chars().take(16000).collect::<String>(),"scope":"first five PDF pages, bounded extraction; may be empty","untrusted_content":true})
                     } else {
                         let mut value = summary(entry);
-                        value["open_url"] = content_url(config, entry, false).into();
-                        value["download_url"] = content_url(config, entry, true).into();
+                        if entry.kind == "directory" {
+                            value["open_url"] = format!(
+                                "{}/files/{}",
+                                config.public_url.trim_end_matches('/'),
+                                entry.cid
+                            )
+                            .into();
+                            value["download_url"] = Value::Null;
+                        } else {
+                            value["open_url"] = content_url(config, entry, false).into();
+                            value["download_url"] = content_url(config, entry, true).into();
+                        }
                         value
                     }
                 }
@@ -672,7 +807,7 @@ pub fn escape(value: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
-fn bytes(value: Option<u64>) -> String {
+pub(crate) fn bytes(value: Option<u64>) -> String {
     match value {
         Some(v) if v >= 1024 * 1024 => format!("{:.1} MB", v as f64 / 1048576.),
         Some(v) if v >= 1024 => format!("{:.1} KB", v as f64 / 1024.),
@@ -680,7 +815,7 @@ fn bytes(value: Option<u64>) -> String {
         None => "Size pending".into(),
     }
 }
-fn page(title: &str, body: &str) -> String {
+pub(crate) fn page(title: &str, body: &str) -> String {
     include_str!("library.html")
         .replace("{{TITLE}}", &escape(title))
         .replace("{{BODY}}", body)
