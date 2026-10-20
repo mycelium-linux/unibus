@@ -29,6 +29,19 @@ verify it. Remove the grant to revoke it immediately. It is reusable within
 that interval, not a one-use token: inspect the tool result and read back
 external state before retrying a write.
 
+Each helper invocation issues a fresh capability for that approved call. There
+is no periodic renewal of exact-call capabilities. Automatic callers must carry
+the existing owner, bot and space authorization through an authenticated
+per-invocation issuer boundary before requesting a fresh capability. An enrolled
+desktop device credential or a discovered provider does not supply that approval.
+
+Mycelium's bounded signed service-grant renewal and the receiving trust-cache
+adapter serve a separate interface, documented in
+[Iroh service channels](iroh-service-channels.md). They preserve an existing
+signed service permit; they do not issue `_meta.unibus_authorization` or turn a
+TV session permit into MCP write access. FPL Auth owns desktop session renewal,
+while each upstream provider owns its OAuth credential lifecycle.
+
 Validate that reads still work and an ungranted mutation fails before issuing
 real writes. An MCP client that cannot attach `_meta.unibus_authorization`
 still cannot invoke writes directly; this helper supplies that metadata

@@ -86,6 +86,9 @@ retained grant's serial/expiry, then enable the timer. The timer checks every
 and reports failure; it does not extend expiry. Revocation delivery requires
 connectivity and a successful reconciliation; the lease expiry bounds offline
 access. The service does not promise instantaneous revocation during partition.
+If a partial gossip view omits the expected grant, independently verified
+revocations are still retained before the adapter reports a failure. The
+retained grant and its expiry remain unchanged until a valid renewal arrives.
 
 Qualified on two Linux hosts on 2026-10-17: an automatic issuer scheduler pass
 advanced the serial, gossip delivered that record to both local daemons, and
