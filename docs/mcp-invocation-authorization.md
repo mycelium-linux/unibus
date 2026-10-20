@@ -17,6 +17,19 @@ Keep device enrollment and session renewal with FPL Auth. Keep signed peer and
 service grants with Mycelium, and exact-call policy issuance with Unibus. An
 exchange must call these owners rather than copy their policy into the desktop.
 
+Source interfaces inspected for this proposal:
+
+| Owner | Source boundary |
+| --- | --- |
+| Agent application | `packages/adapters/src/mcp-connector.ts`: `McpConnector.execute` checks the assignment; `mcp-transport.ts`: `McpSession.callTool` sends name/arguments |
+| FPL desktop services | `rust/fpl-desktop-bridge/src/proxy.rs`: `proxy_request` and `send_upstream` authenticate the device and forward the body |
+| Hosted MCP gateway | shared-infra `batty/librechat/fpl-mcp-bridge/server.mjs`: `checkFplGrant` and `resolveDesktopCapability` resolve owner and device |
+| Exact-call issuer | Unibus `crates/unibus-mcp/src/bin/unibus-mcp-authorize.rs`: `request` locks, bounds and atomically updates the private policy |
+| Desktop session renewal | desktop-services `rust/fpl-enrollment/src/renewal.rs`: `send_authenticated`; Auth `src/pg.rs`: `renew_desktop_session` |
+
+These source observations identify the missing contract; they do not establish
+that every installed binary matches a clean committed checkout.
+
 ## Proposed narrow interface
 
 After its ordinary assignment and invocation-approval checks, the application
