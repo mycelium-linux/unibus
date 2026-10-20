@@ -16,6 +16,10 @@ unibus.workspace = true
 unibus-quic = { path = "../unibus-quic" }
 unibus-iroh = { path = "../unibus-iroh", features = ["fleet-identity"], optional = true }
 
+[dev-dependencies]
+ed25519-dalek = "2.2"
+tempfile.workspace = true
+
 [[bin]]
 name = "unibus-mycelium-grants"
 path = "src/bin/unibus-mycelium-grants.rs"
