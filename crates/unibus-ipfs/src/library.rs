@@ -537,6 +537,27 @@ async fn detail(
         escape(&entry.name_source),
         escape(&entry.text.chars().take(12_000).collect::<String>())
     );
+    if headers
+        .get("x-library-can-direct")
+        .is_some_and(|h| h == "true")
+    {
+        let mut direct = reqwest::Url::parse(&app.config.public_url).unwrap();
+        direct.set_path("/direct");
+        direct
+            .query_pairs_mut()
+            .append_pair("cid", &cid)
+            .append_pair("path", &query.path)
+            .append_pair("name", &download_name(entry));
+        let action = format!(
+            " <a class=open href='{}'>Download via Iroh</a>",
+            escape(direct.as_str())
+        );
+        body = body.replacen(
+            "</p><section class=details>",
+            &format!("{action}</p><section class=details>"),
+            1,
+        );
+    }
     if let Some(error) = &entry.inspection_error {
         write!(
             body,
@@ -664,12 +685,18 @@ async fn content(
     };
     let (offset, length, partial) = range;
     let mut upstream = None;
-    for node in app
-        .config
-        .nodes
-        .iter()
-        .filter(|node| entry.nodes.contains(&node.name))
-    {
+    let preferred = headers
+        .get("x-library-prefer-node")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|name| app.config.nodes.iter().find(|n| n.name == name));
+    // A configured local Kubo may fetch and cache known collection content through
+    // its private swarm. This does not create a pin or change replica observations.
+    let candidates = preferred
+        .into_iter()
+        .chain(app.config.nodes.iter().filter(|node| {
+            entry.nodes.contains(&node.name) && preferred.is_none_or(|p| p.name != node.name)
+        }));
+    for node in candidates {
         let work = app
             .http
             .post(format!("{}/api/v0/cat", node.rpc.trim_end_matches('/')))
