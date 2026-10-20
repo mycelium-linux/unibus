@@ -1,0 +1,43 @@
+{
+  "observed_at": "2026-10-20T03:09:58.522Z",
+  "scope": "bounded real-browser/native echo; not an IPFS file or off-tailnet qualification",
+  "browser": "Chrome for Testing 152.0.7977.42, fresh headless profile on Neo",
+  "native_provider": "temporary Rust echo fixture on Titan",
+  "iroh_version": "1.3.0",
+  "wasm_bindgen_version": "0.2.129",
+  "requested_mode": "webrtc_only",
+  "bytes_verified": 32785,
+  "sha256": "7a2a211ee90ff953599f9990fbc893c1ec99e6513631ca131d6cfb0d7348e19d",
+  "selected_iroh_path": {
+    "kind": "custom WebRTC",
+    "selected": true,
+    "rtt_ms": 205.437174
+  },
+  "selected_ice_pair": {
+    "state": "succeeded",
+    "nominated": true,
+    "writable": true,
+    "local": {
+      "address": "fd7a:115c:a1e0::cf01:65cf",
+      "candidate_type": "prflx",
+      "protocol": "udp"
+    },
+    "remote": {
+      "address": "fd7a:115c:a1e0::6534:775",
+      "candidate_type": "host",
+      "protocol": "udp"
+    }
+  },
+  "network_classification": "direct WebRTC over Tailnet; no Iroh relay data path selected",
+  "limits": [
+    "This result does not establish Dad's LAN or public NAT connectivity.",
+    "A closure-lifetime error appeared during cleanup after verified data. Callback detachment was corrected in commit 69500b0.",
+    "A subsequent independent echo retry timed out without a browser page error. Root owns final Avery IPFS transfer qualification using the production-equivalent controlled broker."
+  ],
+  "source_checks": {
+    "native_check": "passed",
+    "wasm_check_with_browser_fixture": "passed",
+    "vendored_transport_tests": 48,
+    "range_framing_tests": 3
+  }
+}
