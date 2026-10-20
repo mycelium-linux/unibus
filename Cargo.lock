@@ -4495,12 +4495,16 @@ name = "unibus-ipfs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "cid",
+ "futures-util",
  "getrandom 0.4.3",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
+ "tokio",
  "unibus",
  "unibus-router",
 ]

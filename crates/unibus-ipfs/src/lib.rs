@@ -4,6 +4,9 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{io::Read, time::Duration};
 
+pub mod catalog;
+pub mod library;
+
 pub const FETCH: &str = "unibus.ipfs.fetch.v1";
 pub const CONTENT: &str = "unibus.ipfs.content.v1";
 pub const ERROR: &str = "unibus.ipfs.error.v1";
@@ -77,6 +80,32 @@ struct FileStat {
 }
 
 impl Kubo {
+    /// Fixed internal commands only. Never use a caller-provided RPC path.
+    pub(crate) fn catalog_rpc(
+        &self,
+        command: &str,
+        query: &[(&str, String)],
+        limit: u64,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            matches!(command, "pin/ls" | "files/stat" | "ls" | "cat"),
+            "unsupported catalog command"
+        );
+        let response = self
+            .client
+            .post(format!("{}/api/v0/{command}", self.endpoint))
+            .query(query)
+            .send()?
+            .error_for_status()?;
+        ensure!(response.status().is_success(), "Kubo returned non-success");
+        let mut bytes = Vec::new();
+        response.take(limit + 1).read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 <= limit,
+            "Kubo catalog response exceeded limit"
+        );
+        Ok(bytes)
+    }
     /// Admin RPC stays loopback-only. The adapter never forwards arbitrary URLs.
     pub fn new(endpoint: &str) -> Result<Self> {
         let url = reqwest::Url::parse(endpoint)?;
