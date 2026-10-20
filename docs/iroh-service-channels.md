@@ -100,6 +100,36 @@ separate visual check. Qualification also passed 17 Iroh tests, seven adapter
 tests, three issuer-renewal tests and the isolated offline SSH-renewal gossip
 integration test.
 
+### Forced renewal qualification, 2026-10-20
+
+The existing issuer schedule and actual home-pi receiver were checked without
+changing their configuration. The original credential was not naturally due:
+its renewal margin would begin on October 24 at 01:45:54 UTC. After a successful dry
+run, one manually forced renewal of the existing
+`unibus-hdhomerun-iroh-20261017` grant advanced serial `1792287954` to
+`1792461780` at October 20, 02:03:00 UTC. Expiry became October 27,
+02:03:00 UTC, exactly seven days forward and within the unchanged authorization
+deadline of January 16, 2027, 01:46:11 UTC. The policy file checksum, original
+issuer, grant ID, principal, single service scope, empty roles/accounts/SSH keys,
+and authorization shape remained unchanged. The renewed credential's ordinary
+renewal margin begins on October 26 at 02:03:00 UTC.
+
+The existing home-pi timer and installed adapter adopted the renewed signed
+record by 02:03:59 UTC.
+Its reconciliation service reported success at 02:03:55 UTC, and the tuner
+bridge retained PID `2075330` and its original start time. No manual receiver
+run, service restart, playback request, device command or network change was
+made. This qualifies a forced issuer renewal, gossip delivery and one actual
+receiver's adoption; it does not qualify a naturally due automatic scheduler
+pass, a second receiver, or playback during this test.
+
+A separate post-write issuer `access list --json` read timed out after five
+seconds. The successful publish and receiver adoption do not remove that
+control-plane latency observation. The write was issued once and was not
+retried. Neither this test nor the existing TV permit establishes MCP mutation
+authority; that boundary is described in
+[the invocation authorization proposal](mcp-invocation-authorization.md).
+
 ## UDP compatibility for existing adapters
 
 `unibus-iroh-udp CONFIG.json` carries bounded loopback UDP packets on authorized
