@@ -59,6 +59,25 @@ It cannot launch arbitrary apps or install an APK. The manual equivalent is
 package-manager launcher resolution, `am start -W --activity-single-top -n`, then
 `dumpsys window windows` focus verification.
 
+## Bounded document apply
+
+```sh
+canvas-fleet apply /path/to/document.json studio,firetv --dry-run
+canvas-fleet apply /path/to/document.json studio,firetv
+```
+
+`apply` validates the owner document envelope (48 KiB maximum, identity,
+project, positive revision), binds each target's observed runtime revision,
+sends one `apply_document`, then reads the named workspace back and verifies it.
+A document codec can canonicalize owner defaults before comparison, exactly as
+`sync` does. The Marbles-specific API mapping stays in Marbles; this command
+carries the already-materialized document.
+
+The corresponding gateway operation is `canvas.workspace.apply` with input
+`{"document": {...}, "expected_revision": N}`. It is bounded by the same
+document size and identity checks and still depends on the target lease
+advertising the operation.
+
 ## Explicit workspace sync
 
 ```sh
