@@ -9,9 +9,45 @@ use unibus::gateway::{GatewayInvoke, ResourceId};
 
 pub const INSPECT: &str = "canvas.inspect";
 pub const SWITCH: &str = "canvas.workspace.switch";
+pub const APPLY: &str = "canvas.workspace.apply";
 pub mod fleet;
 pub mod sync;
 const MAX_REPLY: u64 = 60 * 1024;
+const MAX_DOCUMENT: usize = 48 * 1024;
+
+/// Validate the owner document envelope without duplicating Canvas's full
+/// schema. Canvas remains the authority on widget/layout semantics; this only
+/// enforces the bounds a gateway must not cross.
+pub fn validate_document(document: &Value) -> Result<u64> {
+    ensure!(
+        serde_json::to_vec(document)?.len() <= MAX_DOCUMENT,
+        "workspace document exceeds 48 KiB apply bound"
+    );
+    ensure!(document.is_object(), "workspace document must be an object");
+    ensure!(
+        document["schema_version"] == 1,
+        "unsupported workspace document schema"
+    );
+    let id = document["id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("workspace document has no identity"))?;
+    ensure!(
+        !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control),
+        "invalid workspace document id"
+    );
+    let project = document["project_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("workspace document has no project id"))?;
+    ensure!(
+        !project.is_empty() && project.len() <= 128 && !project.chars().any(char::is_control),
+        "invalid workspace project id"
+    );
+    let revision = document["revision"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("workspace document has no revision"))?;
+    ensure!(revision > 0, "workspace revision must be positive");
+    Ok(revision)
+}
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +63,12 @@ struct InspectInput {}
 #[serde(deny_unknown_fields)]
 struct SwitchInput {
     name: String,
+    expected_revision: u64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyInput {
+    document: Value,
     expected_revision: u64,
 }
 impl CanvasAdapter {
@@ -60,6 +102,18 @@ impl CanvasAdapter {
                 );
                 (
                     json!({"command":"workspace_switch","name":input.name}),
+                    Some(input.expected_revision),
+                )
+            }
+            APPLY => {
+                let input: ApplyInput = serde_json::from_value(invocation.input.clone())?;
+                validate_document(&input.document)?;
+                ensure!(
+                    input.expected_revision > 0,
+                    "expected_revision must be positive"
+                );
+                (
+                    json!({"command":"apply_document","document":input.document}),
                     Some(input.expected_revision),
                 )
             }
@@ -282,6 +336,23 @@ mod tests {
             adapter.request(&invocation).unwrap()["expected_revision"],
             7
         );
+        invocation.operation = APPLY.into();
+        invocation.input = json!({
+            "document": {
+                "schema_version":1,
+                "id":"marbles-live",
+                "project_id":"marbles",
+                "revision":1,
+                "surfaces":[],
+                "layout":{"kind":"canvas","placements":[]}
+            },
+            "expected_revision":7
+        });
+        let request = adapter.request(&invocation).unwrap();
+        assert_eq!(request["command"]["command"], "apply_document");
+        assert_eq!(request["expected_revision"], 7);
+        invocation.input = json!({"document":{"schema_version":1},"expected_revision":7});
+        assert!(adapter.request(&invocation).is_err());
         invocation.resource.key = "another".into();
         assert!(adapter.request(&invocation).is_err());
     }

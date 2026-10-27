@@ -53,25 +53,12 @@ async fn canonicalize(config: &Config, input: &Value, name: &str) -> Result<Valu
     Ok(normalized)
 }
 fn validate(document: &Value, name: &str) -> Result<u64> {
-    ensure!(
-        serde_json::to_vec(document)?.len() <= 48 * 1024,
-        "workspace document exceeds 48 KiB sync bound"
-    );
+    let revision = crate::validate_document(document)?;
     ensure!(
         document["project_id"] == name,
         "source document project does not match requested workspace"
     );
-    ensure!(
-        document["schema_version"] == 1,
-        "unsupported workspace document schema"
-    );
-    ensure!(
-        document["id"].as_str().is_some_and(|id| !id.is_empty()),
-        "workspace document has no identity"
-    );
-    document["revision"]
-        .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("workspace document has no revision"))
+    Ok(revision)
 }
 fn compare(source: &Value, target: &Value) -> Result<bool> {
     ensure!(
@@ -140,6 +127,130 @@ fn missing(receipt: &Receipt, name: &str) -> bool {
         || (reply.pointer("/outcome/code").and_then(Value::as_str) == Some("invalid_request")
             && reply.pointer("/outcome/message").and_then(Value::as_str)
                 == Some(format!("unknown project workspace: {name}").as_str()))
+}
+
+/// Apply one already-materialized owner document to every selected endpoint.
+///
+/// The document is validated only for the gateway bounds; Canvas owns widget
+/// and layout semantics. Each target is bound to its observed runtime revision,
+/// applied once, and verified by reading the named workspace back exactly.
+pub async fn apply_document(
+    config: &Config,
+    document: &Value,
+    targets: &[String],
+    dry_run: bool,
+) -> Result<Vec<SyncReceipt>> {
+    let name = document["project_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("workspace document has no project id"))?;
+    validate(document, name)?;
+    let document = canonicalize(config, document, name).await?;
+    ensure!(targets.len() <= 32, "oversized target selection");
+    let mut results = Vec::new();
+    let mut tasks: tokio::task::JoinSet<Result<SyncReceipt, anyhow::Error>> =
+        tokio::task::JoinSet::new();
+    for target in targets {
+        if !config.targets.contains_key(target) {
+            results.push(SyncReceipt {
+                target: target.clone(),
+                ok: false,
+                state: "failed".into(),
+                error: Some("unknown target endpoint".into()),
+            });
+            continue;
+        }
+        let config = config.clone();
+        let target = target.clone();
+        let document = document.clone();
+        tasks.spawn(async move {
+            let result = apply_target(&config, &target, &document, dry_run).await;
+            Ok(match result {
+                Ok(state) => SyncReceipt {
+                    target,
+                    ok: true,
+                    state: state.into(),
+                    error: None,
+                },
+                Err(error) => SyncReceipt {
+                    target,
+                    ok: false,
+                    state: "failed".into(),
+                    error: Some(error.to_string()),
+                },
+            })
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        results.push(result??);
+    }
+    results.sort_by(|a, b| a.target.cmp(&b.target));
+    Ok(results)
+}
+
+async fn apply_target(
+    config: &Config,
+    target: &str,
+    document: &Value,
+    dry_run: bool,
+) -> Result<&'static str> {
+    let inspection = config
+        .run(&[target.to_owned()], Action::Inspect)
+        .await
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing inspection"))?;
+    let inspection = success(inspection)?;
+    let revision = inspection["revision"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("inspection omitted endpoint revision"))?;
+    let name = document["project_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("workspace document has no project id"))?;
+    let existing = request(
+        config,
+        target,
+        json!({"command":"workspace_read","name":name}),
+        None,
+    )
+    .await?;
+    if !missing(&existing, name) {
+        let reply = success(existing)?;
+        let existing = self::document(&reply)
+            .ok_or_else(|| anyhow::anyhow!("target returned no workspace document"))?;
+        let existing = canonicalize(config, existing, name).await?;
+        if &existing == document {
+            return Ok("unchanged");
+        }
+    }
+    if dry_run {
+        return Ok("would_apply");
+    }
+    success(
+        request(
+            config,
+            target,
+            json!({"command":"apply_document","document":document}),
+            Some(revision),
+        )
+        .await?,
+    )?;
+    let verification = success(
+        request(
+            config,
+            target,
+            json!({"command":"workspace_read","name":name}),
+            None,
+        )
+        .await?,
+    )?;
+    let verified = self::document(&verification)
+        .ok_or_else(|| anyhow::anyhow!("read-back returned no workspace document"))?;
+    let verified = canonicalize(config, verified, name).await?;
+    ensure!(
+        &verified == document,
+        "read-back document differs; apply not verified"
+    );
+    Ok("applied")
 }
 
 pub async fn sync(

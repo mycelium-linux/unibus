@@ -1,16 +1,20 @@
 use anyhow::{Result, ensure};
 use unibus_canvas::fleet::{Action, Config, endpoint_status, format_status};
+use unibus_canvas::validate_document;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "--help" || a == "-h") {
         println!(
-            "canvas-fleet status [GROUP_OR_TARGETS] [--json] [--config PATH]\ncanvas-fleet launch GROUP_OR_TARGETS [--config PATH]\ncanvas-fleet sync SOURCE WORKSPACE TARGETS [--activate] [--dry-run] [--config PATH]\ncanvas-fleet CONFIG GROUP_OR_TARGETS inspect\ncanvas-fleet CONFIG GROUP_OR_TARGETS switch WORKSPACE"
+            "canvas-fleet status [GROUP_OR_TARGETS] [--json] [--config PATH]\ncanvas-fleet launch GROUP_OR_TARGETS [--config PATH]\ncanvas-fleet sync SOURCE WORKSPACE TARGETS [--activate] [--dry-run] [--config PATH]\ncanvas-fleet apply DOCUMENT_JSON TARGETS [--dry-run] [--config PATH]\ncanvas-fleet CONFIG GROUP_OR_TARGETS inspect\ncanvas-fleet CONFIG GROUP_OR_TARGETS switch WORKSPACE"
         );
         return Ok(());
     }
     if args.first().is_some_and(|a| a == "sync") {
         return sync(&args[1..]).await;
+    }
+    if args.first().is_some_and(|a| a == "apply") {
+        return apply(&args[1..]).await;
     }
     if args.first().is_some_and(|a| a == "status") {
         return status(&args[1..]).await;
@@ -104,6 +108,49 @@ fn load_config(path: Option<&str>) -> Result<Config> {
         bus.resolve_token_file(&path);
     }
     Ok(config)
+}
+
+async fn apply(args: &[String]) -> Result<()> {
+    ensure!(
+        args.len() >= 2,
+        "usage: canvas-fleet apply DOCUMENT_JSON TARGETS [--dry-run] [--config PATH]"
+    );
+    let document_path = std::path::PathBuf::from(&args[0]);
+    let targets = &args[1];
+    let mut dry_run = false;
+    let mut config_path = None;
+    let mut flags = args[2..].iter();
+    while let Some(flag) = flags.next() {
+        match flag.as_str() {
+            "--dry-run" => dry_run = true,
+            "--config" => {
+                config_path = Some(
+                    flags
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?
+                        .as_str(),
+                )
+            }
+            _ => anyhow::bail!("unknown apply option {flag}"),
+        }
+    }
+    let metadata = std::fs::metadata(&document_path)?;
+    ensure!(
+        metadata.len() <= 48 * 1024,
+        "workspace document exceeds 48 KiB apply bound"
+    );
+    let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&document_path)?)?;
+    validate_document(&document)?;
+    let config = load_config(config_path)?;
+    let targets = config.select(targets)?;
+    let results =
+        unibus_canvas::sync::apply_document(&config, &document, &targets, dry_run).await?;
+    println!("{}", serde_json::to_string_pretty(&results)?);
+    ensure!(
+        results.iter().all(|result| result.ok),
+        "one or more endpoints failed to apply"
+    );
+    Ok(())
 }
 
 async fn sync(args: &[String]) -> Result<()> {
