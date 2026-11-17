@@ -180,6 +180,37 @@ impl Session {
         }
     }
 }
+/// Publish one body and return once it is on the wire.
+///
+/// [`Session`] is built for a host that stays alive: it queues, it polls, and a
+/// failed send is a status flag. A program whose whole job is one message has
+/// none of that to offer, and cannot use the queue's fire-and-forget answer —
+/// "queued" is not "sent", and a CLI that exits after queueing can drop the
+/// frame in `Drop` before the worker ever writes it.
+///
+/// So this is [`unibus::client::Client`] directly: connect, frame, write, done.
+/// The validation is [`Publish::validate`] rather than a second copy of the same
+/// rules, because a body the router would refuse should be refused here, by the
+/// same code that refuses it in an embedded host.
+///
+/// # Errors
+///
+/// Returns an error if the body is invalid, the router refuses the connection,
+/// or the frame cannot be written.
+pub fn publish_once(config: ClientConfig, publish: Publish) -> Result<String> {
+    publish.validate()?;
+    let client = Client::connect(config)?;
+    let request_id = unibus::envelope::next_request_id();
+    let mut envelope = client.envelope(
+        publish.destination.as_deref(),
+        Message::new(&publish.kind, publish.body),
+    )?;
+    envelope.request_id = request_id.clone();
+    envelope.payload_bytes = 0;
+    client.send(&envelope, &[])?;
+    Ok(request_id)
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -235,6 +266,82 @@ mod tests {
         assert!(ids.contains(&id));
         assert!(session.publish(command()).is_ok());
     }
+    /// The one-shot path a scheduled job uses: connect, write, and know it was
+    /// written before returning.
+    #[test]
+    fn publish_once_writes_the_frame_before_it_returns() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut token = tempfile::NamedTempFile::new().unwrap();
+        token.write_all(b"secret-transport-token").unwrap();
+        let config: ClientConfig = serde_json::from_value(serde_json::json!({
+            "installation_id": "test", "producer_id": "arborist",
+            "hub_endpoint": listener.local_addr().unwrap().to_string(),
+            "token_file": token.path(), "zones": ["test"], "schema_version": 2
+        }))
+        .unwrap();
+
+        let router = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let (registration, _) = framing::read_frame(&mut socket).unwrap();
+            let reply = Envelope::new(
+                "test",
+                "router",
+                Some("arborist"),
+                "secret-transport-token",
+                Message::new(
+                    kinds::V1_REPLY,
+                    serde_json::json!({"request_id": registration.request_id, "success": true}),
+                ),
+            );
+            framing::write_frame(&mut socket, &reply, &[]).unwrap();
+            framing::read_frame(&mut socket).unwrap().0
+        });
+
+        let id = publish_once(
+            config,
+            Publish {
+                destination: None,
+                kind: "arborist.scan".into(),
+                body: serde_json::json!({"headline": "133 of 150 fail"}),
+            },
+        )
+        .expect("published");
+
+        // Reading happens after the write, so a `publish_once` that returned
+        // before the frame left would deadlock here instead of passing.
+        let command = router.join().expect("router thread");
+        assert_eq!(command.message.kind, "arborist.scan");
+        assert_eq!(command.request_id, id);
+        assert_eq!(command.message.body["headline"], "133 of 150 fail");
+    }
+
+    #[test]
+    fn publish_once_refuses_a_body_the_router_would() {
+        let config: ClientConfig = serde_json::from_value(serde_json::json!({
+            "installation_id": "test", "producer_id": "arborist",
+            "hub_endpoint": "127.0.0.1:1", "zones": ["test"]
+        }))
+        .unwrap();
+        // A non-object body never reaches the socket, so this cannot pass by
+        // accidentally connecting to something.
+        let error = publish_once(
+            config,
+            Publish {
+                destination: None,
+                kind: "arborist.scan".into(),
+                body: serde_json::json!([1, 2, 3]),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("object"), "{error}");
+    }
+
     #[test]
     fn real_framing_publish_poll_overflow_and_disconnect() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
