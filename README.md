@@ -75,6 +75,37 @@ topics and binary payloads over the reliable `mqtt.publish.v1` Unibus contract.
 Broker sessions, retained state, and MQTT acknowledgements remain broker-owned.
 See [`docs/mqtt-bridge-runbook.md`](docs/mqtt-bridge-runbook.md).
 
+`crates/unibus-mail` — bounded POP3/IMAP metadata contracts. The mail owner
+keeps the mailbox session and publishes only `email.account.v1`,
+`email.message.v1`, and `email.delta.v1`; content is fetched through an
+authorized `email.fetch.v1` request and is never broadcast. Credentials are
+named as `geode://...` references and resolved only by the local owner. See
+[`docs/mail-bridge-runbook.md`](docs/mail-bridge-runbook.md).
+
+`crates/unibus-mail-imap` — the IMAP owner adapter and `unibus-mail-imap`
+publisher. It owns the TLS session,
+fetches metadata-only windows with `UIDVALIDITY`/`UID` identity, answers bounded
+`email.fetch.v1` requests with `BODY.PEEK[]`, and supports `LOGIN` plus XOAUTH2
+(needed for Gmail and other OAuth2 providers). See
+[`docs/mail-gmail.md`](docs/mail-gmail.md).
+
+`crates/unibus-chat` and `crates/unibus-irc` — chat contracts and the first
+transport, including the `unibus-irc` publisher. The IRC adapter negotiates `message-tags`/`server-time`, uses IRCv3
+`msgid` when present and an explicitly local identity otherwise, and keeps a
+bounded in-memory text ring so `chat.fetch.v1` never broadcasts message bodies.
+See [`docs/chat-bridge-runbook.md`](docs/chat-bridge-runbook.md).
+
+`crates/unibus-room` — room membership, presence and audio-bus declarations.
+The `unibus-room` binary is a hub with the room plugin installed; `room-probe`
+joins one room from another machine and prints live membership. The service
+keeps no media bytes: audio stays on isochrone/WebRTC adapters. See
+[`docs/room-service.md`](docs/room-service.md).
+
+`crates/unibus-credentials` — shared `env://` and `geode://` resolution for the
+adapters. `geode://realm/account/slot` leases from a running `geoded` Unix
+socket; `GEODE_ENV_FALLBACK=1` selects geode's `EnvBackend` mapping for
+development/tests.
+
 Routing is configuration: the hub maps message kinds to capabilities via a
 `routes` table; unknown kinds without a plugin fail loudly. The hub parses
 only `register` — every data body stays opaque.
