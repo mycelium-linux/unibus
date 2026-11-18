@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Decision Catalog Protocol discovery and execution binding for Unibus"
 
+[features]
+default = []
+state-only-catalogs = []
+
 [dependencies]
 anyhow.workspace = true
 dcp.workspace = true
@@ -12,3 +16,4 @@ serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
 unibus.workspace = true
+unibus-mycelium = { path = "../unibus-mycelium" }

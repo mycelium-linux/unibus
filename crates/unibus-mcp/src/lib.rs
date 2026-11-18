@@ -14,7 +14,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use unibus::Message;
 
+pub mod authorization;
+pub mod client_setup;
+pub mod discovery;
 pub mod http;
+pub mod peer_acl;
 pub mod server;
 
 pub const MCP_SCHEMA_VERSION: u32 = 1;
@@ -79,6 +83,35 @@ impl ToolDescriptor {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct PromptDescriptor {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub arguments: Vec<Value>,
+}
+
+impl PromptDescriptor {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            valid_mcp_name(&self.name),
+            "invalid MCP prompt name {}",
+            self.name
+        );
+        ensure!(
+            self.description.len() <= 16_384,
+            "prompt description is too large"
+        );
+        ensure!(
+            serde_json::to_vec(&self.arguments)?.len() <= MAX_CATALOG_BYTES,
+            "prompt arguments are too large"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderAdvertisement {
     pub schema_version: u32,
     pub provider_id: String,
@@ -91,6 +124,8 @@ pub struct ProviderAdvertisement {
     pub expires_at_unix_ms: u64,
     pub catalog_digest: String,
     pub tools: Vec<ToolDescriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompts: Vec<PromptDescriptor>,
 }
 
 impl ProviderAdvertisement {
@@ -114,9 +149,16 @@ impl ProviderAdvertisement {
             expires_at_unix_ms,
             catalog_digest,
             tools,
+            prompts: Vec::new(),
         };
         advertisement.validate(issued_at_unix_ms)?;
         Ok(advertisement)
+    }
+
+    pub fn with_prompts(mut self, prompts: Vec<PromptDescriptor>) -> Result<Self> {
+        self.prompts = prompts;
+        self.catalog_digest = catalog_digest_with_prompts(&self.tools, &self.prompts)?;
+        Ok(self)
     }
 
     pub fn validate(&self, now_unix_ms: u64) -> Result<()> {
@@ -156,12 +198,23 @@ impl ProviderAdvertisement {
                 tool.name
             );
         }
+        for prompt in &self.prompts {
+            prompt.validate()?;
+            ensure!(
+                names.insert(prompt.name.as_str()),
+                "duplicate MCP name {}",
+                prompt.name
+            );
+        }
         ensure!(
             serde_json::to_vec(&self.tools)?.len() <= MAX_CATALOG_BYTES,
             "catalog is too large"
         );
         ensure!(
-            self.catalog_digest == catalog_digest(&self.tools)?,
+            self.catalog_digest == catalog_digest_with_prompts(&self.tools, &self.prompts)?
+                || (self.prompts.is_empty()
+                    && self.catalog_digest
+                        == digest_json(&serde_json::json!({"tools":self.tools,"prompts":[]}))?),
             "catalog digest mismatch"
         );
         Ok(())
@@ -175,8 +228,9 @@ impl ProviderAdvertisement {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationGrant {
-    /// Compact, signed, audience-bound grant. It is authorization evidence,
-    /// not a reusable provider credential.
+    /// Verifier-defined authorization evidence, not a provider credential.
+    /// Scoped local policies use short-lived, argument-bound bearer capabilities;
+    /// other verifiers may use signed audience-bound grants.
     pub encoded: String,
 }
 
@@ -348,6 +402,21 @@ pub trait AuthorizationVerifier {
         tool: &ToolDescriptor,
         now_unix_ms: u64,
     ) -> Result<Self::Claims>;
+
+    /// Override when grants bind arguments, not just a provider/tool audience.
+    fn verify_invocation(
+        &self,
+        invocation: &Invocation,
+        tool: &ToolDescriptor,
+        now_unix_ms: u64,
+    ) -> Result<Self::Claims> {
+        self.verify(
+            &invocation.authorization,
+            &invocation.provider_id,
+            tool,
+            now_unix_ms,
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -493,10 +562,25 @@ impl InvocationLedger {
 }
 
 pub fn catalog_digest(tools: &[ToolDescriptor]) -> Result<String> {
+    catalog_digest_with_prompts(tools, &[])
+}
+
+pub fn catalog_digest_with_prompts(
+    tools: &[ToolDescriptor],
+    prompts: &[PromptDescriptor],
+) -> Result<String> {
     for tool in tools {
         tool.validate()?;
     }
-    digest_json(&serde_json::to_value(tools)?)
+    for prompt in prompts {
+        prompt.validate()?;
+    }
+    // Schema v1 publishers hash the tools array. Preserve that wire contract
+    // when no prompts exist; prompt-bearing catalogs cover both collections.
+    if prompts.is_empty() {
+        return digest_json(&serde_json::to_value(tools)?);
+    }
+    digest_json(&serde_json::json!({"tools":tools,"prompts":prompts}))
 }
 
 fn digest_json(value: &Value) -> Result<String> {
@@ -587,12 +671,7 @@ pub fn require_tool_authorization<V: AuthorizationVerifier>(
     invocation.validate()?;
     let tool =
         registry.resolve_tool(&invocation.provider_id, &invocation.tool_name, now_unix_ms)?;
-    verifier.verify(
-        &invocation.authorization,
-        &invocation.provider_id,
-        tool,
-        now_unix_ms,
-    )
+    verifier.verify_invocation(invocation, tool, now_unix_ms)
 }
 
 #[cfg(test)]
@@ -633,6 +712,42 @@ mod tests {
                 encoded: "signed-grant".into(),
             },
         }
+    }
+
+    #[test]
+    fn tools_only_catalog_preserves_v1_and_accepts_transitional_digest() {
+        let mut ad = advertisement(1_000);
+        assert_eq!(
+            ad.catalog_digest,
+            digest_json(&serde_json::to_value(&ad.tools).unwrap()).unwrap()
+        );
+        ad.validate(1_000).unwrap();
+        let mut tampered = ad.clone();
+        tampered.tools[0].description.push_str(" altered");
+        assert!(tampered.validate(1_000).is_err());
+        ad.catalog_digest =
+            digest_json(&serde_json::json!({"tools":ad.tools,"prompts":[]})).unwrap();
+        ad.validate(1_000).unwrap();
+        ad.tools[0].description.push_str(" altered");
+        assert!(ad.validate(1_000).is_err());
+    }
+
+    #[test]
+    fn prompt_catalog_cannot_use_tools_only_digest() {
+        let mut ad = advertisement(1_000)
+            .with_prompts(vec![PromptDescriptor {
+                name: "explain".into(),
+                description: "Explain a function".into(),
+                arguments: vec![],
+            }])
+            .unwrap();
+        ad.validate(1_000).unwrap();
+        let valid_digest = ad.catalog_digest.clone();
+        ad.catalog_digest = catalog_digest(&ad.tools).unwrap();
+        assert!(ad.validate(1_000).is_err());
+        ad.catalog_digest = valid_digest;
+        ad.prompts[0].description.push_str(" altered");
+        assert!(ad.validate(1_000).is_err());
     }
 
     #[test]

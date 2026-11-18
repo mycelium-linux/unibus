@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -10,7 +11,10 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use unibus::client::{Client, ClientConfig};
+use unibus::{AdoptionPolicy, AdoptionStatus};
+use unibus_mycelium::MyceliumServiceDirectory;
 
+use crate::discovery::{AdoptionReconciler, HttpMcpProbe};
 use crate::{
     AuthorizationGrant, Invocation, InvocationOutcome, MCP_SCHEMA_VERSION, PROVIDER_KIND,
     ProviderAdvertisement, ProviderRegistry, RESULT_KIND, ToolResult, decode_message,
@@ -22,6 +26,33 @@ pub struct BridgeConfig {
     pub listen: String,
     #[serde(default = "default_timeout_ms")]
     pub invocation_timeout_ms: u64,
+    #[serde(default)]
+    pub authorization_policy_file: Option<PathBuf>,
+    #[serde(default)]
+    pub lan_permissive_mutations: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryConfig {
+    pub mycelium_socket: PathBuf,
+    pub local_node_id: String,
+    #[serde(default = "default_discovery_refresh_ms")]
+    pub refresh_ms: u64,
+    #[serde(default = "default_discovery_lease_ms")]
+    pub lease_ms: u64,
+    #[serde(default = "default_discovery_max_failures")]
+    pub max_failures: u32,
+}
+
+fn default_discovery_refresh_ms() -> u64 {
+    10_000
+}
+fn default_discovery_lease_ms() -> u64 {
+    30_000
+}
+fn default_discovery_max_failures() -> u32 {
+    3
 }
 
 fn default_timeout_ms() -> u64 {
@@ -29,10 +60,18 @@ fn default_timeout_ms() -> u64 {
 }
 
 struct State {
+    authorization: crate::authorization::PolicyVerifier,
     bus: Arc<Client>,
     registry: Mutex<ProviderRegistry>,
     pending: Mutex<BTreeMap<String, mpsc::Sender<ToolResult>>>,
     audit: Mutex<VecDeque<AuditEntry>>,
+    adoption: Option<Mutex<AdoptionRuntime>>,
+    adoption_status: Mutex<Vec<AdoptionStatus>>,
+}
+
+struct AdoptionRuntime {
+    directory: MyceliumServiceDirectory,
+    reconciler: AdoptionReconciler<HttpMcpProbe>,
 }
 
 const MAX_AUDIT_ENTRIES: usize = 256;
@@ -47,7 +86,11 @@ struct AuditEntry {
     outcome: String,
 }
 
-pub fn serve(bus_config: ClientConfig, config: BridgeConfig) -> Result<()> {
+pub fn serve(
+    bus_config: ClientConfig,
+    config: BridgeConfig,
+    discovery: Option<DiscoveryConfig>,
+) -> Result<()> {
     ensure!(
         bus_config
             .capabilities
@@ -59,13 +102,23 @@ pub fn serve(bus_config: ClientConfig, config: BridgeConfig) -> Result<()> {
         (1_000..=300_000).contains(&config.invocation_timeout_ms),
         "invocation_timeout_ms must be 1000..=300000"
     );
+    let adoption = discovery
+        .as_ref()
+        .map(|discovery| build_adoption(discovery, &bus_config.producer_id))
+        .transpose()?;
     let listener = TcpListener::bind(&config.listen)
         .with_context(|| format!("bind MCP bridge at {}", config.listen))?;
     let state = Arc::new(State {
+        authorization: crate::authorization::PolicyVerifier::configured(
+            config.authorization_policy_file,
+            config.lan_permissive_mutations,
+        )?,
         bus: Arc::new(Client::connect(bus_config)?),
         registry: Mutex::new(ProviderRegistry::default()),
         pending: Mutex::new(BTreeMap::new()),
         audit: Mutex::new(VecDeque::with_capacity(MAX_AUDIT_ENTRIES)),
+        adoption: adoption.map(Mutex::new),
+        adoption_status: Mutex::new(Vec::new()),
     });
     {
         let state = state.clone();
@@ -80,6 +133,12 @@ pub fn serve(bus_config: ClientConfig, config: BridgeConfig) -> Result<()> {
                 }
             })?;
     }
+    if let Some(discovery) = discovery {
+        let state = state.clone();
+        std::thread::Builder::new()
+            .name("unibus-mcp-discovery".into())
+            .spawn(move || discovery_loop(&state, Duration::from_millis(discovery.refresh_ms)))?;
+    }
     eprintln!("unibus-mcp listening on http://{}/mcp", config.listen);
     for stream in listener.incoming() {
         let stream = stream?;
@@ -90,6 +149,55 @@ pub fn serve(bus_config: ClientConfig, config: BridgeConfig) -> Result<()> {
                 eprintln!("MCP request failed: {error:#}");
             }
         });
+    }
+    Ok(())
+}
+
+fn build_adoption(config: &DiscoveryConfig, producer_id: &str) -> Result<AdoptionRuntime> {
+    ensure!(
+        (1_000..=300_000).contains(&config.refresh_ms),
+        "discovery refresh_ms must be 1000..=300000"
+    );
+    let directory = MyceliumServiceDirectory::new(config.mycelium_socket.clone())?;
+    let probe = HttpMcpProbe::new(producer_id, config.lease_ms)?;
+    let reconciler = AdoptionReconciler::new(
+        AdoptionPolicy {
+            local_node_id: config.local_node_id.clone(),
+            max_failures: config.max_failures,
+        },
+        probe,
+    )?;
+    Ok(AdoptionRuntime {
+        directory,
+        reconciler,
+    })
+}
+
+fn discovery_loop(state: &State, refresh: Duration) {
+    loop {
+        if let Err(error) = refresh_discovery(state) {
+            eprintln!("MCP discovery refresh failed: {error:#}");
+        }
+        std::thread::sleep(refresh);
+    }
+}
+
+fn refresh_discovery(state: &State) -> Result<()> {
+    let now = unibus::envelope::now_ms();
+    let Some(adoption) = &state.adoption else {
+        return Ok(());
+    };
+    let mut adoption = adoption.lock().unwrap();
+    let AdoptionRuntime {
+        directory,
+        reconciler,
+    } = &mut *adoption;
+    let advertisements = reconciler.refresh(directory, now)?;
+    *state.adoption_status.lock().unwrap() = reconciler.statuses().cloned().collect();
+    let mut registry = state.registry.lock().unwrap();
+    registry.prune(now);
+    for advertisement in advertisements {
+        registry.upsert(advertisement, now)?;
     }
     Ok(())
 }
@@ -161,10 +269,17 @@ fn handle_http(mut stream: TcpStream, state: &State, timeout: Duration) -> Resul
     let result = match method {
         "initialize" => serde_json::json!({
             "protocolVersion":"2025-06-18",
-            "capabilities":{"tools":{"listChanged":true}},
+            "capabilities":{"tools":{"listChanged":true},"prompts":{"listChanged":true}},
             "serverInfo":{"name":"unibus-mcp","version":env!("CARGO_PKG_VERSION")}
         }),
         "tools/list" => list_tools(state),
+        "prompts/list" => list_prompts(state),
+        "prompts/get" => {
+            match get_prompt(state, request.get("params").cloned().unwrap_or_default()) {
+                Ok(value) => value,
+                Err(error) => return rpc_error(&mut stream, id, -32000, &format!("{error:#}")),
+            }
+        }
         "tools/call" => match call_tool(
             state,
             request.get("params").cloned().unwrap_or_default(),
@@ -197,6 +312,57 @@ fn list_tools(state: &State) -> Value {
         }
     }
     serde_json::json!({"tools":tools})
+}
+
+fn list_prompts(state: &State) -> Value {
+    let now = unibus::envelope::now_ms();
+    let registry = state.registry.lock().unwrap();
+    let prompts = registry
+        .active(now)
+        .flat_map(|provider| {
+            provider.prompts.iter().map(move |prompt| {
+                serde_json::json!({
+                    "name": external_name(&provider.provider_id, &prompt.name),
+                    "description": format!("[{}] {}", provider.provider_id, prompt.description),
+                    "arguments": prompt.arguments,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({"prompts":prompts})
+}
+
+fn get_prompt(state: &State, params: Value) -> Result<Value> {
+    let external = params
+        .get("name")
+        .and_then(Value::as_str)
+        .context("missing prompt name")?;
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let now = unibus::envelope::now_ms();
+    let registry = state.registry.lock().unwrap();
+    let (provider_id, prompt_name) = registry
+        .active(now)
+        .find_map(|provider| {
+            provider
+                .prompts
+                .iter()
+                .find(|prompt| external_name(&provider.provider_id, &prompt.name) == external)
+                .map(|prompt| (provider.provider_id.clone(), prompt.name.clone()))
+        })
+        .context("unknown or unavailable prompt")?;
+    drop(registry);
+    let adoption = state
+        .adoption
+        .as_ref()
+        .context("prompt provider is not locally adopted")?;
+    adoption
+        .lock()
+        .unwrap()
+        .reconciler
+        .get_prompt(&provider_id, &prompt_name, arguments)
 }
 
 fn external_name(provider: &str, tool: &str) -> String {
@@ -254,23 +420,52 @@ fn call_tool_inner(
                 .map(|tool| (provider, tool))
         })
         .context("unknown or unavailable tool")?;
-    ensure!(
-        tool.mutation == crate::MutationClass::ReadOnly,
-        "tool is not classified read-only"
-    );
     let invocation_id = format!("mcp-{}-{}", now, next_sequence());
     let invocation = Invocation {
         schema_version: MCP_SCHEMA_VERSION,
         invocation_id: invocation_id.clone(),
         provider_id: provider.provider_id.clone(),
         tool_name: tool.name.clone(),
-        arguments,
+        arguments: arguments.clone(),
         authorization: AuthorizationGrant {
-            encoded: "unibus-local-read".into(),
+            encoded: if tool.mutation == crate::MutationClass::ReadOnly {
+                "unibus-local-read".into()
+            } else if tool.mutation == crate::MutationClass::Mutating
+                && state.authorization.is_lan_permissive()
+            {
+                "unibus-lan-permissive".into()
+            } else {
+                params
+                    .pointer("/_meta/unibus_authorization")
+                    .and_then(Value::as_str)
+                    .context(
+                        "tool is not classified read-only; explicit scoped authorization required",
+                    )?
+                    .into()
+            },
         },
     };
+    crate::AuthorizationVerifier::verify_invocation(&state.authorization, &invocation, tool, now)?;
+    let read_only = tool.mutation == crate::MutationClass::ReadOnly;
     let destination = provider.producer_id.clone();
+    let provider_id = provider.provider_id.clone();
+    let tool_name = tool.name.clone();
     drop(registry);
+    if let Some(adoption) = &state.adoption {
+        let mut adoption = adoption.lock().unwrap();
+        if adoption.reconciler.statuses().any(|status| {
+            status.state == unibus::AdoptionState::Active
+                && status.provider_id.as_deref() == Some(&provider_id)
+        }) {
+            ensure!(
+                read_only,
+                "scoped mutations require an authenticated Unibus publisher"
+            );
+            return adoption
+                .reconciler
+                .call_tool(&provider_id, &tool_name, arguments);
+        }
+    }
     let (sender, receiver) = mpsc::channel();
     state
         .pending
@@ -317,12 +512,14 @@ fn capability_view(state: &State) -> Value {
     let now = unibus::envelope::now_ms();
     let registry = state.registry.lock().unwrap();
     let audit = state.audit.lock().unwrap();
-    project_capabilities(&registry, &audit, now)
+    let adoption = state.adoption_status.lock().unwrap();
+    project_capabilities(&registry, &audit, &adoption, now)
 }
 
 fn project_capabilities(
     registry: &ProviderRegistry,
     audit: &VecDeque<AuditEntry>,
+    adoption: &[AdoptionStatus],
     now: u64,
 ) -> Value {
     let providers = registry
@@ -348,7 +545,7 @@ fn project_capabilities(
                 "issued_at_unix_ms":provider.issued_at_unix_ms,
                 "expires_at_unix_ms":provider.expires_at_unix_ms,
                 "catalog_digest":provider.catalog_digest,
-                "counts":{"total":provider.tools.len(),"read_only":read_only,"mutating":mutating,"unknown":unknown}
+                "counts":{"total":provider.tools.len(),"read_only":read_only,"mutating":mutating,"unknown":unknown,"prompts":provider.prompts.len()}
             })
         })
         .collect::<Vec<_>>();
@@ -357,6 +554,7 @@ fn project_capabilities(
         "schema_version":1,
         "generated_at_unix_ms":now,
         "providers":providers,
+        "adoption":adoption,
         "recent_invocations":audit,
         "redaction":{"arguments":true,"results":true,"authorization":true,"credentials":true}
     })
@@ -400,7 +598,7 @@ mod tests {
             outcome: "success".into(),
         }]);
 
-        let view = project_capabilities(&registry, &audit, 7_000);
+        let view = project_capabilities(&registry, &audit, &[], 7_000);
         assert_eq!(view["providers"][0]["lease_status"], "stale");
         assert_eq!(view["providers"][0]["counts"]["read_only"], 1);
         assert_eq!(view["recent_invocations"][0]["outcome"], "success");

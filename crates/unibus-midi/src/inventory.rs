@@ -131,9 +131,7 @@ impl MidiPortInventory {
     }
 
     pub fn is_fresh(&self, now_ms: u64) -> bool {
-        unibus::envelope::lease_is_fresh(
-            self.observed_at_unix_ms, self.valid_until_unix_ms, now_ms,
-        )
+        unibus::envelope::lease_is_fresh(self.observed_at_unix_ms, self.valid_until_unix_ms, now_ms)
     }
 }
 
@@ -175,7 +173,10 @@ impl MidiInventoryRegistry {
     }
 }
 
-#[cfg(all(feature = "devices", any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(all(
+    feature = "devices",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 pub fn enumerate(producer_id: &str, now_ms: u64, ttl_ms: u64) -> Result<MidiPortInventory> {
     let input = midir::MidiInput::new("unibus-midi-discovery-input")?;
     let output = midir::MidiOutput::new("unibus-midi-discovery-output")?;

@@ -181,7 +181,7 @@ fn announce(bus: &Client, config: &Config) -> Result<()> {
     let projection = stream
         .project_v2(
             &format!("qemu/{}/display", config.target_id),
-            &format!("{}:{}", config.target_id, now),
+            &format!("{}-{now}", config.target_id),
             "unibus-qemu",
         )
         .map_err(anyhow::Error::msg)?;

@@ -7,18 +7,24 @@ use provider_worker::{Call, Event, Worker};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use unibus::client::{Client, ClientConfig};
+use unibus_mcp::client_setup::{self, Client as SetupClient};
 use unibus_mcp::http::{McpClient, ProviderConfig};
-use unibus_mcp::server::{BridgeConfig, serve};
+use unibus_mcp::server::{BridgeConfig, DiscoveryConfig, serve};
 use unibus_mcp::{
-    AuthorizationGrant, AuthorizationVerifier, Claim, INVOKE_KIND, Invocation, InvocationLedger,
-    InvocationOutcome, MCP_SCHEMA_VERSION, MutationClass, ProviderAdvertisement, ProviderRegistry,
-    RESULT_KIND, ToolDescriptor, ToolResult, catalog_digest, decode_message,
-    require_tool_authorization,
+    AuthorizationVerifier, Claim, INVOKE_KIND, Invocation, InvocationLedger, InvocationOutcome,
+    MCP_SCHEMA_VERSION, ProviderAdvertisement, ProviderRegistry, RESULT_KIND, ToolResult,
+    catalog_digest, decode_message, require_tool_authorization,
 };
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
+    #[serde(default)]
+    peer_acl: Option<unibus_mcp::peer_acl::PeerAclConfig>,
+    #[serde(default)]
+    authorization_policy_file: Option<std::path::PathBuf>,
+    #[serde(default)]
+    lan_permissive_mutations: bool,
     #[serde(default)]
     unibus: Option<ClientConfig>,
     #[serde(default = "default_lease_ms")]
@@ -27,6 +33,8 @@ struct Config {
     providers: Vec<ProviderConfig>,
     #[serde(default)]
     bridge: Option<BridgeConfig>,
+    #[serde(default)]
+    discovery: Option<DiscoveryConfig>,
 }
 
 fn default_lease_ms() -> u64 {
@@ -35,12 +43,15 @@ fn default_lease_ms() -> u64 {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let command = args
-        .next()
-        .context("usage: unibus-mcp inspect|publish|serve <config.json>")?;
+    let command = args.next().context(
+        "usage: unibus-mcp inspect|publish|serve <config.json> | setup-clients [options]",
+    )?;
+    if command == "setup-clients" {
+        return setup_clients(args.collect());
+    }
     ensure!(
         matches!(command.as_str(), "inspect" | "publish" | "serve"),
-        "command must be `inspect`, `publish`, or `serve`"
+        "command must be `inspect`, `publish`, `serve`, or `setup-clients`"
     );
     let path = args
         .next()
@@ -59,20 +70,68 @@ fn main() -> Result<()> {
             ensure!(!config.providers.is_empty(), "no MCP providers configured");
             publish(config)
         }
-        "serve" => serve(
-            config
+        "serve" => {
+            let bus = config
                 .unibus
-                .context("serve requires `unibus` client configuration")?,
-            config
+                .context("serve requires `unibus` client configuration")?;
+            let bridge = config
                 .bridge
-                .context("serve requires `bridge` configuration")?,
-        ),
+                .context("serve requires `bridge` configuration")?;
+            serve(bus, bridge, config.discovery)
+        }
         _ => {
             ensure!(!config.providers.is_empty(), "no MCP providers configured");
             println!("{}", serde_json::to_string_pretty(&inspect(&config)?)?);
             Ok(())
         }
     }
+}
+
+fn setup_clients(arguments: Vec<String>) -> Result<()> {
+    let mut endpoint = "http://127.0.0.1:18791/mcp".to_owned();
+    let mut selected = Vec::new();
+    let mut write = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--write" => write = true,
+            "--endpoint" => {
+                index += 1;
+                endpoint = arguments
+                    .get(index)
+                    .context("--endpoint needs a URL")?
+                    .clone();
+            }
+            "--client" => {
+                index += 1;
+                selected.push(match arguments.get(index).map(String::as_str) {
+                    Some("codex") => SetupClient::Codex,
+                    Some("claude") | Some("claude-code") => SetupClient::ClaudeCode,
+                    Some("opencode") => SetupClient::OpenCode,
+                    Some(value) => anyhow::bail!("unsupported MCP client {value}"),
+                    None => anyhow::bail!("--client needs codex, claude, or opencode"),
+                });
+            }
+            other => anyhow::bail!("unexpected setup-clients argument {other}"),
+        }
+        index += 1;
+    }
+    if selected.is_empty() {
+        selected.extend([
+            SetupClient::Codex,
+            SetupClient::ClaudeCode,
+            SetupClient::OpenCode,
+        ]);
+    }
+    let actions = client_setup::plan(&endpoint, &selected)?;
+    println!("{}", serde_json::to_string_pretty(&actions)?);
+    if write {
+        let home = std::env::var_os("HOME").context("HOME is unavailable")?;
+        client_setup::apply(&actions, Path::new(&home))?;
+    } else {
+        eprintln!("preview only; pass --write to apply");
+    }
+    Ok(())
 }
 
 fn inspect(config: &Config) -> Result<Vec<ProviderAdvertisement>> {
@@ -101,6 +160,9 @@ fn inspect(config: &Config) -> Result<Vec<ProviderAdvertisement>> {
 }
 
 fn publish(config: Config) -> Result<()> {
+    if let Some(acl) = &config.peer_acl {
+        acl.validate_feature()?;
+    }
     let unibus = config
         .unibus
         .clone()
@@ -113,7 +175,11 @@ fn publish(config: Config) -> Result<()> {
         "publisher must declare mcp.provider capability"
     );
     let bus = Client::connect(unibus)?;
-    let verifier = std::sync::Arc::new(LocalReadOnlyVerifier);
+    let verifier = std::sync::Arc::new(unibus_mcp::authorization::PolicyVerifier::configured(
+        config.authorization_policy_file.clone(),
+        config.lan_permissive_mutations,
+    )?);
+    let peer_acl = std::sync::Arc::new(config.peer_acl);
     let refresh = Duration::from_millis(config.lease_ms / 2);
     let (events, received) = std::sync::mpsc::sync_channel(128);
     let mut providers = config
@@ -122,16 +188,15 @@ fn publish(config: Config) -> Result<()> {
         .enumerate()
         .map(|(index, provider)| {
             let verifier = verifier.clone();
+            let acl = peer_acl.clone();
+            let destination = provider.clone();
             let authorize: provider_worker::Authorizer = std::sync::Arc::new(move |call, tool| {
                 let now = unibus::envelope::now_ms();
-
+                if let Some(acl) = acl.as_ref() {
+                    acl.authorize(&call.producer, &destination, now / 1000)?;
+                }
                 verifier
-                    .verify(
-                        &call.invocation.authorization,
-                        &call.invocation.provider_id,
-                        tool,
-                        now,
-                    )
+                    .verify_invocation(&call.invocation, tool, now)
                     .map(|_| ())
             });
             Worker::start(index, provider.clone(), refresh, events.clone(), authorize)
@@ -213,6 +278,7 @@ fn publish(config: Config) -> Result<()> {
                     &*verifier,
                     &mut ledger,
                     &invocation,
+                    peer_acl.as_ref().as_ref(),
                     &envelope.producer_id,
                 );
                 if let Err(error) = result {
@@ -249,37 +315,26 @@ fn send_result(
     Ok(())
 }
 
-struct LocalReadOnlyVerifier;
-
-impl AuthorizationVerifier for LocalReadOnlyVerifier {
-    type Claims = ();
-    fn verify(
-        &self,
-        grant: &AuthorizationGrant,
-        _provider: &str,
-        tool: &ToolDescriptor,
-        _now: u64,
-    ) -> Result<()> {
-        ensure!(
-            grant.encoded == "unibus-local-read",
-            "untrusted authorization grant"
-        );
-        ensure!(
-            tool.mutation == MutationClass::ReadOnly,
-            "tool is not classified read-only"
-        );
-        Ok(())
-    }
-}
-
 fn execute_invocation(
     providers: &mut [Worker],
     registry: &ProviderRegistry,
-    verifier: &LocalReadOnlyVerifier,
+    verifier: &unibus_mcp::authorization::PolicyVerifier,
     ledger: &mut InvocationLedger,
     invocation: &Invocation,
+    peer_acl: Option<&unibus_mcp::peer_acl::PeerAclConfig>,
     authenticated_producer: &str,
 ) -> Result<()> {
+    if let Some(acl) = peer_acl {
+        let provider = providers
+            .iter()
+            .find(|worker| worker.config.provider_id == invocation.provider_id)
+            .context("provider is not configured")?;
+        acl.authorize(
+            authenticated_producer,
+            &provider.config,
+            unibus::envelope::now_ms() / 1000,
+        )?;
+    }
     require_tool_authorization(verifier, registry, invocation, unibus::envelope::now_ms())?;
     let worker = providers
         .iter()

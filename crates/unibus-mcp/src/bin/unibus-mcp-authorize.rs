@@ -1,7 +1,7 @@
 //! Operator-authorized exact-call grants. Pipe stdout directly to the MCP
 //! endpoint: it contains a short-lived capability, never log or commit it.
-use anyhow::{ensure, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, ensure};
+use serde_json::{Value, json};
 use std::{
     fs,
     io::Read,
@@ -97,8 +97,10 @@ fn request(
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    ensure!(args.len() == 4,
-        "usage: unibus-mcp-authorize POLICY_FILE PROVIDER TOOL ARGUMENTS_JSON_FILE (pipe stdout to MCP)");
+    ensure!(
+        args.len() == 4,
+        "usage: unibus-mcp-authorize POLICY_FILE PROVIDER TOOL ARGUMENTS_JSON_FILE (pipe stdout to MCP)"
+    );
     let arguments: Value = serde_json::from_slice(&fs::read(&args[3])?)?;
     let output = request(
         Path::new(&args[0]),

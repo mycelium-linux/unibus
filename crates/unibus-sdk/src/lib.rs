@@ -30,6 +30,7 @@ pub struct Publish {
 #[derive(Debug, Serialize)]
 pub struct Event {
     pub producer_id: String,
+    pub destination: Option<String>,
     pub request_id: String,
     pub issued_at_unix_ms: u64,
     pub kind: String,
@@ -117,6 +118,7 @@ impl Session {
                         }
                         let event = Event {
                             producer_id: envelope.producer_id,
+                            destination: envelope.destination,
                             request_id: envelope.request_id,
                             issued_at_unix_ms: envelope.issued_at_unix_ms,
                             kind: envelope.message.kind,
@@ -338,11 +340,14 @@ mod tests {
     fn projection_has_no_credentials() {
         let event = Event {
             producer_id: "source".into(),
+            destination: Some("recipient".into()),
             request_id: "1".into(),
             issued_at_unix_ms: 1,
             kind: "test".into(),
             body: serde_json::json!({}),
         };
-        assert!(serde_json::to_value(event).unwrap().get("token").is_none());
+        let projected = serde_json::to_value(event).unwrap();
+        assert!(projected.get("token").is_none());
+        assert_eq!(projected["destination"], "recipient");
     }
 }

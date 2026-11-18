@@ -13,7 +13,7 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{MutationClass, ToolDescriptor};
+use crate::{MutationClass, PromptDescriptor, ToolDescriptor};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SESSION_HEADER: &str = "mcp-session-id";
@@ -91,6 +91,20 @@ impl McpClient {
         match self {
             Self::Http(client) => client.call_tool(name, arguments),
             Self::Stdio(client) => client.call_tool(name, arguments),
+        }
+    }
+
+    pub fn list_prompts(&mut self) -> Result<Vec<PromptDescriptor>> {
+        match self {
+            Self::Http(client) => client.list_prompts(),
+            Self::Stdio(client) => client.list_prompts(),
+        }
+    }
+
+    pub fn get_prompt(&mut self, name: &str, arguments: Value) -> Result<Value> {
+        match self {
+            Self::Http(client) => client.get_prompt(name, arguments),
+            Self::Stdio(client) => client.get_prompt(name, arguments),
         }
     }
 }
@@ -174,6 +188,20 @@ impl McpStdioClient {
         .get("result")
         .cloned()
         .context("MCP tools/call returned no result")
+    }
+
+    fn list_prompts(&mut self) -> Result<Vec<PromptDescriptor>> {
+        prompt_descriptors(&self.request("prompts/list", serde_json::json!({}))?)
+    }
+
+    fn get_prompt(&mut self, name: &str, arguments: Value) -> Result<Value> {
+        self.request(
+            "prompts/get",
+            serde_json::json!({"name":name,"arguments":arguments}),
+        )?
+        .get("result")
+        .cloned()
+        .context("MCP prompts/get returned no result")
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -262,8 +290,10 @@ impl McpHttpClient {
     pub fn connect(endpoint: impl Into<String>) -> Result<Self> {
         let endpoint = endpoint.into();
         ensure!(
-            endpoint.starts_with("http://127.0.0.1:") || endpoint.starts_with("http://[::1]:"),
-            "provider endpoint must be loopback HTTP"
+            endpoint.starts_with("https://")
+                || endpoint.starts_with("http://127.0.0.1:")
+                || endpoint.starts_with("http://[::1]:"),
+            "provider endpoint must be authenticated HTTPS or loopback HTTP"
         );
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(3))
@@ -324,6 +354,20 @@ impl McpHttpClient {
             .get("result")
             .cloned()
             .context("MCP tools/call returned no result")
+    }
+
+    pub fn list_prompts(&mut self) -> Result<Vec<PromptDescriptor>> {
+        prompt_descriptors(&self.request("prompts/list", serde_json::json!({}))?)
+    }
+
+    pub fn get_prompt(&mut self, name: &str, arguments: Value) -> Result<Value> {
+        self.request(
+            "prompts/get",
+            serde_json::json!({"name":name,"arguments":arguments}),
+        )?
+        .get("result")
+        .cloned()
+        .context("MCP prompts/get returned no result")
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -432,6 +476,37 @@ fn descriptor(tool: &Value, overrides: &BTreeMap<String, MutationClass>) -> Resu
         mutation: overrides.get(&name).copied().unwrap_or(inferred),
         name,
     })
+}
+
+fn prompt_descriptors(response: &Value) -> Result<Vec<PromptDescriptor>> {
+    let prompts = response
+        .pointer("/result/prompts")
+        .and_then(Value::as_array)
+        .context("MCP prompts/list returned no prompts")?;
+    prompts
+        .iter()
+        .map(|prompt| {
+            let descriptor = PromptDescriptor {
+                name: prompt
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .context("MCP prompt has no name")?
+                    .to_owned(),
+                description: prompt
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                arguments: prompt
+                    .get("arguments")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            };
+            descriptor.validate()?;
+            Ok(descriptor)
+        })
+        .collect()
 }
 
 #[cfg(test)]

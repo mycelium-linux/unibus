@@ -5,10 +5,18 @@ edition.workspace = true
 license.workspace = true
 description = "MCP provider discovery and invocation contracts over Unibus"
 
+[features]
+default = []
+scoped-authorization = []
+lan-permissive-mutations = []
+mycelium-peer-acl = []
+
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+json5.workspace = true
 sha2.workspace = true
 unibus.workspace = true
+unibus-mycelium = { path = "../unibus-mycelium" }
 reqwest.workspace = true

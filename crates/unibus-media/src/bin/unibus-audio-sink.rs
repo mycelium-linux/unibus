@@ -29,11 +29,18 @@ fn main() -> Result<()> {
     let path = std::env::args()
         .nth(1)
         .context("usage: unibus-audio-sink <config.json>")?;
-    let config: Config =
+    let mut config: Config =
         serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("read {path}"))?)?;
+    config.bus.resolve_token_file(std::path::Path::new(&path));
+    // Reject invalid static configuration before retrying runtime interruptions.
+    AudioIngress::new(config.stream_id.clone(), config.maximum_age_ms)?;
+    unibus_media::audio_session::supervise("unibus-audio-sink", || run(&config));
+}
+
+fn run(config: &Config) -> Result<()> {
     let audio = UnixDatagram::unbound()?;
     audio.set_write_timeout(Some(Duration::from_millis(20)))?;
-    let client = Client::connect(config.bus)?;
+    let client = Client::connect(config.bus.clone())?;
     let mut ingress = AudioIngress::new(config.stream_id.clone(), config.maximum_age_ms)?;
     loop {
         let Some((envelope, payload)) = client.try_read()? else {

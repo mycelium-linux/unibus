@@ -3,7 +3,8 @@ use serde::Deserialize;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{RecvTimeoutError, TrySendError, sync_channel};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use unibus::Message;
 use unibus::client::{Client, ClientConfig};
 use unibus_media::{
@@ -103,7 +104,10 @@ fn main() -> Result<()> {
         .nth(1)
         .context("usage: unibus-audio-tap <config.json>")?;
     let bytes = std::fs::read(&path).with_context(|| format!("read {path}"))?;
-    let config: Config = serde_json::from_slice(&bytes).with_context(|| format!("parse {path}"))?;
+    let mut config: Config =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {path}"))?;
+    config.bus.resolve_token_file(Path::new(&path));
+    config.bus.read_timeout_ms = config.bus.read_timeout_ms.min(250);
     ensure!(
         (5..=100).contains(&config.chunk_ms),
         "chunk_ms must be 5..=100"
@@ -129,7 +133,18 @@ fn main() -> Result<()> {
     let chunk_bytes = frames as usize * config.channels as usize * 2;
 
     let source = config.backend.source_arguments(&config.capture_device)?;
-    let mut child = Command::new(&config.gst_launch)
+    unibus_media::audio_session::supervise("unibus-audio-tap", || {
+        run(&config, &source, frames, chunk_bytes)
+    });
+}
+
+fn run(config: &Config, source: &[String], frames: u32, chunk_bytes: usize) -> Result<()> {
+    // Connect first: an unavailable hub must not leave a capture process behind.
+    let client = std::sync::Arc::new(Client::connect(config.bus.clone())?);
+    let publication_monitor =
+        unibus::publication_monitor::PublicationMonitor::spawn(client.clone())?;
+    let mut command = Command::new(&config.gst_launch);
+    command
         .arg("-q")
         .args(source)
         .args([
@@ -148,23 +163,47 @@ fn main() -> Result<()> {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("start {}", config.gst_launch.display()))?;
-    let stdout = child.stdout.take().context("GStreamer stdout missing")?;
-    let mut capture = BufReader::new(stdout);
-    let client = Client::connect(config.bus)?;
-    let mut payload = vec![0_u8; chunk_bytes];
+        .stderr(Stdio::inherit());
+    let mut child = unibus_media::audio_session::CaptureProcess::spawn(&mut command)?;
+    let stdout = child.take_stdout()?;
+    let (sender, receiver) = sync_channel(1);
+    std::thread::Builder::new().name("unibus-pcm-capture".into()).spawn(move || {
+        let mut capture = BufReader::new(stdout);
+        let mut dropped = 0_u64;
+        loop {
+            let mut payload = vec![0_u8; chunk_bytes];
+            if let Err(error) = capture.read_exact(&mut payload) {
+                let _ = sender.send(Err(error));
+                break;
+            }
+            match sender.try_send(Ok((Instant::now(), now_ms(), payload))) {
+                Ok(()) => {}
+                Err(TrySendError::Disconnected(_)) => break,
+                Err(TrySendError::Full(_)) => {
+                    dropped = dropped.saturating_add(1);
+                    if dropped.is_power_of_two() { eprintln!("unibus-audio-tap: dropped {dropped} captured chunks while bus was slow"); }
+                }
+            }
+        }
+    })?;
     let mut sequence = 0_u64;
     loop {
-        capture
-            .read_exact(&mut payload)
-            .context("PCM capture ended")?;
+        anyhow::ensure!(client.is_healthy(), "Unibus heartbeat stopped");
+        publication_monitor.check()?;
+        let (captured_at, captured_at_unix_ms, payload) =
+            match receiver.recv_timeout(Duration::from_millis(250)) {
+                Ok(result) => result.context("PCM capture ended")?,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => anyhow::bail!("PCM capture worker stopped"),
+            };
+        if captured_at.elapsed() > Duration::from_millis(u64::from(config.chunk_ms) * 4) {
+            continue;
+        }
         let chunk = AudioPlaybackChunk {
             schema_version: MEDIA_SCHEMA_VERSION,
             stream_id: config.stream_id.clone(),
             sequence,
-            captured_at_unix_ms: now_ms(),
+            captured_at_unix_ms,
             sample_rate_hz: config.sample_rate_hz,
             channels: config.channels,
             frames,

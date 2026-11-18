@@ -217,7 +217,10 @@ impl ObservationSocket {
         use anyhow::{Context, ensure};
         use std::os::unix::fs::FileTypeExt;
 
-        ensure!(path.is_absolute(), "observation socket path must be absolute");
+        ensure!(
+            path.is_absolute(),
+            "observation socket path must be absolute"
+        );
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create observation socket dir {}", parent.display()))?;

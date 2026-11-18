@@ -5,6 +5,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use unibus_router::{Hub, StreamRouter, config::HubConfig};
 
+mod health;
+
 fn main() -> Result<()> {
     if matches!(
         std::env::args().nth(1).as_deref(),
@@ -27,6 +29,7 @@ fn main() -> Result<()> {
         .nth(1)
         .ok_or_else(|| anyhow::anyhow!("usage: unibus-hub <config.json>"))?;
     let config = HubConfig::read(std::path::Path::new(&path))?;
+    health::start_from_env()?;
     let mut hub = Hub::new(config)?;
     anyhow::ensure!(
         (std::env::var_os("UNIBUS_GATEWAY_CATALOG").is_none()

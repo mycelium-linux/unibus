@@ -1,7 +1,7 @@
 //! Trusted-config telemetry collector. No browser-supplied commands or URLs.
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use coherence_widget_contract::{
-    Metric, ModelCatalog, ServedModel, Snapshot, MAX_HISTORY, MESSAGE_KIND,
+    MAX_HISTORY, MESSAGE_KIND, Metric, ModelCatalog, ServedModel, Snapshot,
 };
 use serde::Deserialize;
 use std::{
@@ -12,9 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 use unibus::{
+    Message,
     client::{Client, ClientConfig},
     envelope::now_ms,
-    Message,
 };
 
 #[derive(Deserialize)]
@@ -408,10 +408,12 @@ mod tests {
     fn model_catalog_projects_only_bounded_unique_provider_identities() {
         let catalog = served_models(r#"{"data":[{"id":"org/model","owned_by":"owner","object":"model","private_path":"/secret"}]}"#).unwrap();
         assert_eq!(catalog.entries[0].id, "org/model");
-        assert!(served_models(
-            r#"{"data":[{"id":"same","owned_by":"a"},{"id":"same","owned_by":"b"}]}"#
-        )
-        .is_err());
+        assert!(
+            served_models(
+                r#"{"data":[{"id":"same","owned_by":"a"},{"id":"same","owned_by":"b"}]}"#
+            )
+            .is_err()
+        );
         assert!(served_models("{}").is_err());
         assert!(served_models(r#"{"data":[{"id":"bad\nname","owned_by":"a"}]}"#).is_err());
         assert!(served_models(r#"{"data":[]}"#).unwrap().entries.is_empty());

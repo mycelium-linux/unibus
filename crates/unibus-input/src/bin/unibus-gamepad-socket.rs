@@ -154,7 +154,10 @@ mod unix {
 
     /// Owns the bus connection and may block freely -- it is not on the path
     /// that drains the socket.
-    fn publish_forever(bus_config: &ClientConfig, inbound: &std::sync::mpsc::Receiver<GamepadState>) {
+    fn publish_forever(
+        bus_config: &ClientConfig,
+        inbound: &std::sync::mpsc::Receiver<GamepadState>,
+    ) {
         let mut client: Option<Client> = None;
         let mut backoff = RECONNECT_BACKOFF_MIN;
         while let Ok(state) = inbound.recv() {

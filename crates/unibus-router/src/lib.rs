@@ -9,8 +9,8 @@
 
 pub mod auth;
 pub mod config;
-pub mod hub;
 pub mod gateway;
+pub mod hub;
 mod outbound;
 pub mod plugin;
 pub mod quic;

@@ -12,7 +12,9 @@ use dcp::{Catalog, Discovery, ExecuteRequest, Receipt, VERSION};
 use serde::{Deserialize, Serialize};
 use unibus::Message;
 
+pub mod discovery;
 pub mod http;
+pub mod server;
 
 pub const BINDING_SCHEMA_VERSION: u32 = 1;
 pub const CATALOG_KIND: &str = "dcp.catalog.v1";
@@ -87,7 +89,27 @@ impl CatalogAdvertisement {
             valid_identifier(&self.catalog.provider.id),
             "invalid DCP provider id"
         );
-        ensure!(!self.catalog.actions.is_empty(), "DCP catalog is empty");
+        if self.catalog.actions.is_empty() {
+            ensure!(
+                cfg!(feature = "state-only-catalogs"),
+                "state-only DCP catalogs require state-only-catalogs feature"
+            );
+            ensure!(
+                self.catalog
+                    .state
+                    .as_ref()
+                    .is_some_and(|state| !state.is_empty()),
+                "state-only DCP catalog has no state"
+            );
+            ensure!(
+                self.discovery.endpoints.execute.is_none(),
+                "state-only DCP catalog must not advertise execution"
+            );
+            ensure!(
+                self.catalog.tree.is_empty(),
+                "state-only DCP catalog must not advertise action trees"
+            );
+        }
         ensure!(
             serde_json::to_vec(&self.catalog)?.len() <= MAX_CATALOG_BYTES,
             "DCP catalog is too large"
@@ -412,6 +434,56 @@ mod tests {
         replacement.node_id = "impostor".into();
         registry.upsert(advertisement(40_000), 40_000).unwrap();
         assert!(registry.upsert(replacement, 40_000).is_err());
+    }
+
+    fn state_advertisement() -> CatalogAdvertisement {
+        let mut advertisement = advertisement(1_000);
+        advertisement.catalog.actions.clear();
+        advertisement.catalog.state = Some(BTreeMap::from([(
+            "knowledge".into(),
+            json!({"status":"unknown"}),
+        )]));
+        advertisement.discovery.endpoints.execute = None;
+        advertisement
+    }
+
+    #[test]
+    fn state_catalogs_are_explicitly_feature_gated() {
+        assert_eq!(
+            state_advertisement().validate(1_000).is_ok(),
+            cfg!(feature = "state-only-catalogs")
+        );
+    }
+
+    #[cfg(feature = "state-only-catalogs")]
+    #[test]
+    fn state_catalogs_cannot_claim_execution_or_empty_state() {
+        let mut ad = state_advertisement();
+        ad.discovery.endpoints.execute = Some("/execute".into());
+        assert!(ad.validate(1_000).is_err());
+        let mut ad = state_advertisement();
+        ad.catalog.state = Some(BTreeMap::new());
+        assert!(ad.validate(1_000).is_err());
+        let mut ad = state_advertisement();
+        ad.catalog.state = None;
+        assert!(ad.validate(1_000).is_err());
+    }
+
+    #[cfg(feature = "state-only-catalogs")]
+    #[test]
+    fn state_catalogs_preserve_leases_ownership_and_deny_execution() {
+        let mut registry = ProviderRegistry::default();
+        registry.upsert(state_advertisement(), 1_000).unwrap();
+        assert!(registry.resolve_execution(&execution(), 1_000).is_err());
+        assert!(registry.provider("philips-hue", 31_000).is_none());
+        let mut ad = state_advertisement();
+        ad.node_id = "impostor".into();
+        assert!(registry.upsert(ad, 1_000).is_err());
+        let message = state_advertisement().into_message().unwrap();
+        assert_eq!(
+            decode_message::<CatalogAdvertisement>(&message, CATALOG_KIND).unwrap(),
+            state_advertisement()
+        );
     }
 
     #[test]

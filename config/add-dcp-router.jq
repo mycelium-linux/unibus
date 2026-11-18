@@ -1,6 +1,6 @@
 def without_dcp:
   .routes |= map(select(.kind | startswith("dcp.") | not)) |
-  .nodes |= map(select(.producer_id != "home-dcp-provider" and .producer_id != "radioman-dcp-provider" and .producer_id != "jarvis-dcp-client"));
+  .nodes |= map(select(.producer_id != "home-dcp-provider" and .producer_id != "radioman-dcp-provider" and .producer_id != "canvas-dcp-provider" and .producer_id != "canvas-tv-dcp-provider" and .producer_id != "macos-local-dcp-provider" and .producer_id != "unibus-dcp-bridge" and .producer_id != "jarvis-dcp-client"));
 
 without_dcp |
 .routes += [
@@ -16,7 +16,7 @@ without_dcp |
     "capabilities":["dcp.provider"],
     "publishes":["dcp.catalog.v1","dcp.receipt.v1"],
     "publish_zones":["default"],
-    "publish_producers":["jarvis-dcp-client"]
+    "publish_producers":["unibus-dcp-bridge","jarvis-dcp-client"]
   },
   {
     "producer_id":"radioman-dcp-provider",
@@ -25,7 +25,34 @@ without_dcp |
     "capabilities":["dcp.provider"],
     "publishes":["dcp.catalog.v1","dcp.receipt.v1"],
     "publish_zones":["default"],
-    "publish_producers":["jarvis-dcp-client"]
+    "publish_producers":["unibus-dcp-bridge","jarvis-dcp-client"]
+  },
+  {
+    "producer_id":"canvas-dcp-provider",
+    "token_file":"tokens/canvas-dcp-provider.token",
+    "zones":["default"],
+    "capabilities":["dcp.provider"],
+    "publishes":["dcp.catalog.v1","dcp.receipt.v1"],
+    "publish_zones":["default"],
+    "publish_producers":["unibus-dcp-bridge","jarvis-dcp-client"]
+  },
+  {
+    "producer_id":"macos-local-dcp-provider",
+    "token_file":"tokens/macos-local-dcp-provider.token",
+    "zones":["default"],
+    "capabilities":["dcp.provider"],
+    "publishes":["dcp.catalog.v1","dcp.receipt.v1"],
+    "publish_zones":["default"],
+    "publish_producers":["unibus-dcp-bridge","jarvis-dcp-client"]
+  },
+  {
+    "producer_id":"unibus-dcp-bridge",
+    "token_file":"tokens/unibus-dcp-bridge.token",
+    "zones":["default"],
+    "capabilities":["dcp.client"],
+    "publishes":["dcp.execute.v1"],
+    "publish_zones":["default"],
+    "publish_producers":["home-dcp-provider","radioman-dcp-provider","canvas-dcp-provider","macos-local-dcp-provider"]
   },
   {
     "producer_id":"jarvis-dcp-client",
@@ -34,6 +61,6 @@ without_dcp |
     "capabilities":["dcp.client"],
     "publishes":["dcp.execute.v1"],
     "publish_zones":["default"],
-    "publish_producers":["home-dcp-provider","radioman-dcp-provider"]
+    "publish_producers":["home-dcp-provider","radioman-dcp-provider","canvas-dcp-provider","macos-local-dcp-provider"]
   }
 ]

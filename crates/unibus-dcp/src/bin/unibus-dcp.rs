@@ -7,15 +7,22 @@ use unibus_dcp::{
     BINDING_SCHEMA_VERSION, CatalogAdvertisement, EXECUTE_KIND, Execution, ExecutionReceipt,
     MAX_PROVIDER_LEASE_MS, PROVIDER_CAPABILITY, ProviderRegistry, RECEIPT_KIND, decode_message,
     http::{DcpHttpClient, ProviderConfig},
+    server::{BridgeConfig, DiscoveryConfig, serve},
 };
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
-    unibus: ClientConfig,
+    #[serde(default)]
+    unibus: Option<ClientConfig>,
     #[serde(default = "default_lease_ms")]
     lease_ms: u64,
+    #[serde(default)]
     providers: Vec<ProviderConfig>,
+    #[serde(default)]
+    bridge: Option<BridgeConfig>,
+    #[serde(default)]
+    discovery: Option<DiscoveryConfig>,
 }
 
 fn default_lease_ms() -> u64 {
@@ -26,16 +33,25 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let command = args
         .next()
-        .context("usage: unibus-dcp inspect|publish <config.json>")?;
+        .context("usage: unibus-dcp inspect|publish|serve <config.json>")?;
     ensure!(
-        matches!(command.as_str(), "inspect" | "publish"),
-        "command must be `inspect` or `publish`"
+        matches!(command.as_str(), "inspect" | "publish" | "serve"),
+        "command must be `inspect`, `publish`, or `serve`"
     );
     let path = args
         .next()
         .with_context(|| format!("{command} needs <config.json>"))?;
     ensure!(args.next().is_none(), "unexpected argument");
     let config: Config = serde_json::from_slice(&std::fs::read(Path::new(&path))?)?;
+    if command == "serve" {
+        let bus = config
+            .unibus
+            .context("serve requires `unibus` client configuration")?;
+        let bridge = config
+            .bridge
+            .context("serve requires `bridge` configuration")?;
+        return serve(bus, bridge, config.discovery);
+    }
     validate_config(&config)?;
     if command == "inspect" {
         println!("{}", serde_json::to_string_pretty(&inspect(&config, 0)?)?);
@@ -53,6 +69,8 @@ fn validate_config(config: &Config) -> Result<()> {
     ensure!(
         config
             .unibus
+            .as_ref()
+            .context("publish requires `unibus` client configuration")?
             .capabilities
             .iter()
             .any(|capability| capability == PROVIDER_CAPABILITY),
@@ -138,7 +156,12 @@ fn spawn_refresh_worker<T: Send + 'static>(
 }
 
 fn publish(config: Config) -> Result<()> {
-    let bus = Client::connect(config.unibus.clone())?;
+    let bus = Client::connect(
+        config
+            .unibus
+            .clone()
+            .context("publish requires `unibus` client configuration")?,
+    )?;
     let refresh = Duration::from_millis(config.lease_ms / 2);
     let mut registry = ProviderRegistry::default();
     let clients = config

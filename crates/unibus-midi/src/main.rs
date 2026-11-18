@@ -1,6 +1,7 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,7 @@ use unibus_midi::{
 };
 
 const DEFAULT_QUEUE_CAPACITY: usize = 1024;
+const MAX_EVENT_AGE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,14 +60,19 @@ impl BridgeConfig {
     fn read(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)
             .with_context(|| format!("read MIDI bridge config {}", path.display()))?;
-        let config = serde_json::from_slice::<Self>(&bytes)
+        let mut config = serde_json::from_slice::<Self>(&bytes)
             .with_context(|| format!("parse MIDI bridge config {}", path.display()))?;
+        config.bus.resolve_token_file(path);
         config.validate()?;
         Ok(config)
     }
 
     fn validate(&self) -> Result<()> {
         ensure!(self.queue_capacity > 0, "queue_capacity must be positive");
+        ensure!(
+            self.queue_capacity <= 65_536,
+            "queue_capacity exceeds 65536 packets"
+        );
         ensure!(
             self.bus.schema_version == unibus::SCHEMA_VERSION_V2,
             "MIDI bridge requires Unibus schema_version 2"
@@ -81,6 +88,7 @@ impl BridgeConfig {
                     additional_ports.iter().all(|port| !port.trim().is_empty()),
                     "additional MIDI input port is empty"
                 );
+                ensure!(additional_ports.len() < 128, "too many MIDI input ports");
                 ensure!(
                     valid_identifier(destination),
                     "invalid MIDI destination producer"
@@ -113,7 +121,8 @@ fn main() -> Result<()> {
         bail!("usage: unibus-midi <bridge.json> | --list");
     };
     if argument == "--list-json" {
-        let inventory = unibus_midi::inventory::enumerate("local", unibus::envelope::now_ms(), 6000)?;
+        let inventory =
+            unibus_midi::inventory::enumerate("local", unibus::envelope::now_ms(), 6000)?;
         println!("{}", serde_json::to_string_pretty(&inventory)?);
         return Ok(());
     }
@@ -159,84 +168,163 @@ fn run(config: BridgeConfig) -> Result<()> {
 }
 
 fn run_input(
-    bus_config: ClientConfig,
+    mut bus_config: ClientConfig,
     port_queries: &[String],
     destination: String,
     queue_capacity: usize,
 ) -> Result<()> {
     let producer_id = bus_config.producer_id.clone();
+    bus_config.read_timeout_ms = bus_config.read_timeout_ms.min(250);
     let bus = Arc::new(UnibusClient::connect(bus_config)?);
-    let (sender, receiver) = sync_channel::<(u64, Vec<u8>)>(queue_capacity);
-    let sequence = Arc::new(AtomicU64::new(0));
-
-    let writer_bus = bus.clone();
-    let writer_origin = producer_id.clone();
-    let writer = std::thread::Builder::new()
-        .name("unibus-midi-writer".into())
-        .spawn(move || -> Result<()> {
-            loop {
-                let (timestamp, payload) = match receiver.recv_timeout(Duration::from_secs(1)) {
-                    Ok(packet) => packet,
-                    Err(RecvTimeoutError::Timeout) => {
-                        ensure!(writer_bus.is_healthy(), "Unibus heartbeat stopped");
-                        continue;
+    let publication_monitor = unibus::publication_monitor::PublicationMonitor::spawn(bus.clone())?;
+    let (sender, receiver) = sync_channel::<(Instant, u64, Vec<u8>)>(queue_capacity);
+    let overflow = Arc::new(AtomicBool::new(false));
+    let mut bindings = (0..port_queries.len()).map(|_| None).collect::<Vec<_>>();
+    let mut errors = vec![None; port_queries.len()];
+    let mut sequence = 0_u64;
+    let mut next_scan = Instant::now();
+    loop {
+        ensure!(bus.is_healthy(), "Unibus heartbeat stopped");
+        publication_monitor.check()?;
+        let mut reset = overflow.swap(false, Ordering::AcqRel);
+        if Instant::now() >= next_scan {
+            next_scan = Instant::now() + Duration::from_secs(1);
+            for (index, query) in port_queries.iter().enumerate() {
+                let mut midi = MidiInput::new(&format!("unibus-midi-probe-{index}"))?;
+                midi.ignore(Ignore::None);
+                let selected = select_input_port(&midi, query).map(|port| (port.id(), port));
+                let was_bound = bindings[index].is_some();
+                let port_sender = sender.clone();
+                let port_overflow = overflow.clone();
+                let result = reconcile_binding(&mut bindings[index], selected, |port| {
+                    midi.connect(
+                        &port,
+                        &format!("unibus-midi-capture-{index}"),
+                        move |timestamp, bytes, ()| {
+                            if let Err(TrySendError::Full(_)) =
+                                port_sender.try_send((Instant::now(), timestamp, bytes.to_vec()))
+                            {
+                                // No logging or bus I/O on the platform callback.
+                                port_overflow.store(true, Ordering::Release);
+                            }
+                        },
+                        (),
+                    )
+                    .map_err(|error| anyhow::anyhow!("connect MIDI input {query}: {error}"))
+                });
+                match result {
+                    Ok(changed) => {
+                        reset |= changed;
+                        if changed {
+                            info!(port = %query, %producer_id, "MIDI input bound");
+                        }
+                        errors[index] = None;
                     }
-                    Err(RecvTimeoutError::Disconnected) => bail!("MIDI input channel closed"),
-                };
-                let packet = MidiPacket {
-                    schema_version: MIDI_SCHEMA_VERSION,
-                    origin: writer_origin.clone(),
-                    sequence: sequence.fetch_add(1, Ordering::Relaxed),
-                    source_timestamp_micros: timestamp,
-                };
-                packet.validate(&payload)?;
-                let mut envelope = writer_bus.envelope(
-                    Some(&destination),
-                    Message::new(MIDI_PACKET_CONTRACT, serde_json::to_value(&packet)?),
-                )?;
-                envelope.payload_bytes = payload.len();
-                if let Some((channel, note, velocity)) = note_on(&payload) {
-                    debug!(
-                        sequence = packet.sequence,
-                        channel, note, velocity, "MIDI note captured"
-                    );
-                } else if let Some((channel, control, value)) = control_change(&payload) {
-                    debug!(
-                        sequence = packet.sequence,
-                        channel, control, value, "MIDI control captured"
-                    );
+                    Err(error) => {
+                        reset |= was_bound;
+                        let error = error.to_string();
+                        if errors[index].as_ref() != Some(&error) {
+                            warn!(port = %query, %error, "MIDI input unavailable; retrying while other inputs stay active");
+                        }
+                        errors[index] = Some(error);
+                    }
                 }
-                writer_bus.send(&envelope, &payload)?;
             }
-        })?;
-
-    let mut connections = Vec::with_capacity(port_queries.len());
-    for (index, port_query) in port_queries.iter().enumerate() {
-        let mut midi = MidiInput::new(&format!("unibus-midi-input-{index}"))?;
-        midi.ignore(Ignore::None);
-        let port = select_input_port(&midi, port_query)?;
-        let port_name = midi.port_name(&port)?;
-        let port_sender = sender.clone();
-        let connection = midi
-            .connect(
-                &port,
-                &format!("unibus-midi-capture-{index}"),
-                move |timestamp, bytes, ()| match port_sender.try_send((timestamp, bytes.to_vec()))
-                {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => warn!("MIDI capture queue full; packet dropped"),
-                    Err(TrySendError::Disconnected(_)) => {}
-                },
-                (),
-            )
-            .map_err(|error| anyhow::anyhow!("connect MIDI input {port_name}: {error}"))?;
-        info!(port = %port_name, %producer_id, "MIDI input bridge started");
-        connections.push(connection);
+        }
+        if reset {
+            // Losing a note-off must not leave the remote instrument sounding.
+            // Discard the old queue before sending the reset; never replay it.
+            reset_capture(&receiver, |payload| {
+                publish_input(&bus, &destination, &producer_id, &mut sequence, 0, payload)
+            })?;
+            warn!(
+                "MIDI input changed or queue overflowed; cleared queued events and reset destination"
+            );
+        }
+        match receiver.recv_timeout(Duration::from_millis(25)) {
+            Ok((captured, timestamp, payload)) => {
+                if captured.elapsed() > MAX_EVENT_AGE {
+                    overflow.store(true, Ordering::Release);
+                    continue;
+                }
+                publish_input(
+                    &bus,
+                    &destination,
+                    &producer_id,
+                    &mut sequence,
+                    timestamp,
+                    &payload,
+                )?;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => bail!("MIDI input channel closed"),
+        }
     }
-    drop(sender);
-    writer
-        .join()
-        .map_err(|_| anyhow::anyhow!("MIDI writer thread panicked"))?
+}
+
+fn reset_capture<T>(
+    receiver: &std::sync::mpsc::Receiver<T>,
+    mut send: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    while receiver.try_recv().is_ok() {}
+    for message in reset_messages() {
+        send(&message)?;
+    }
+    Ok(())
+}
+
+/// Re-enumeration is authoritative: a missing/ambiguous selection drops the old
+/// handle, and a changed OS identity is rebound even when its label is unchanged.
+fn reconcile_binding<C, P>(
+    binding: &mut Option<(String, C)>,
+    selected: Result<(String, P)>,
+    connect: impl FnOnce(P) -> Result<C>,
+) -> Result<bool> {
+    let (id, port) = match selected {
+        Ok(selected) => selected,
+        Err(error) => {
+            *binding = None;
+            return Err(error);
+        }
+    };
+    if binding.as_ref().is_some_and(|(current, _)| current == &id) {
+        return Ok(false);
+    }
+    *binding = None;
+    *binding = Some((id, connect(port)?));
+    Ok(true)
+}
+
+fn publish_input(
+    bus: &UnibusClient,
+    destination: &str,
+    origin: &str,
+    sequence: &mut u64,
+    timestamp: u64,
+    payload: &[u8],
+) -> Result<()> {
+    let packet = MidiPacket {
+        schema_version: MIDI_SCHEMA_VERSION,
+        origin: origin.into(),
+        sequence: *sequence,
+        source_timestamp_micros: timestamp,
+    };
+    packet.validate(payload)?;
+    let mut envelope = bus.envelope(
+        Some(destination),
+        Message::new(MIDI_PACKET_CONTRACT, serde_json::to_value(&packet)?),
+    )?;
+    envelope.payload_bytes = payload.len();
+    envelope.ttl_ms = Some(MAX_EVENT_AGE.as_millis() as u64);
+    bus.send(&envelope, payload)?;
+    *sequence = sequence.wrapping_add(1);
+    if let Some((channel, note, velocity)) = note_on(payload) {
+        debug!(channel, note, velocity, "MIDI note captured");
+    }
+    if let Some((channel, control, value)) = control_change(payload) {
+        debug!(channel, control, value, "MIDI control captured");
+    }
+    Ok(())
 }
 
 fn run_output(
@@ -247,22 +335,40 @@ fn run_output(
     let bus = UnibusClient::connect(bus_config)?;
     let midi = MidiOutput::new("unibus-midi-output")?;
     let port = select_output_port(&midi, port_query)?;
+    let port_id = port.id();
     let port_name = midi.port_name(&port)?;
     let mut connection = midi
         .connect(&port, "unibus-midi-playback")
         .map_err(|error| anyhow::anyhow!("connect MIDI output: {error}"))?;
     reset_midi_output(&mut connection)?;
     info!(port = %port_name, ?channel_mode, "MIDI output bridge started");
+    let result = output_session(&bus, &mut connection, port_query, &port_id, channel_mode);
+    if let Err(error) = reset_midi_output(&mut connection) {
+        warn!(%error, "failed to reset MIDI output after session loss");
+    }
+    result
+}
+
+fn output_session(
+    bus: &UnibusClient,
+    connection: &mut midir::MidiOutputConnection,
+    port_query: &str,
+    port_id: &str,
+    channel_mode: OutputChannelMode,
+) -> Result<()> {
+    let mut next_scan = Instant::now();
+    let mut origins = BTreeSet::new();
     loop {
-        let frame = match bus.try_read() {
-            Ok(frame) => frame,
-            Err(error) => {
-                if let Err(reset_error) = reset_midi_output(&mut connection) {
-                    warn!(error = %reset_error, "failed to reset MIDI output after bus loss");
-                }
-                return Err(error);
-            }
-        };
+        if Instant::now() >= next_scan {
+            next_scan = Instant::now() + Duration::from_secs(1);
+            let probe = MidiOutput::new("unibus-midi-output-probe")?;
+            let selected = select_output_port(&probe, port_query)?;
+            ensure!(
+                selected.id() == port_id,
+                "MIDI output identity changed; reopening"
+            );
+        }
+        let frame = bus.try_read()?;
         let Some((envelope, payload)) = frame else {
             continue;
         };
@@ -283,6 +389,10 @@ fn run_output(
             continue;
         }
         if envelope.message.kind == unibus::kinds::NODE_STATE {
+            if envelope.producer_id == "unibus-hub" && lost_origin(&envelope.message, &mut origins)
+            {
+                reset_midi_output(connection)?;
+            }
             continue;
         }
         if envelope.message.kind != MIDI_PACKET_CONTRACT {
@@ -292,6 +402,7 @@ fn run_output(
         let packet: MidiPacket =
             serde_json::from_value(serde_json::Value::Object(envelope.message.body))?;
         packet.validate(&payload)?;
+        origins.insert(envelope.producer_id.clone());
         if let Some((channel, note, velocity)) = note_on(&payload) {
             debug!(
                 sequence = packet.sequence,
@@ -303,8 +414,21 @@ fn run_output(
                 "MIDI note delivered"
             );
         }
-        send_midi(&mut connection, &payload, channel_mode)?;
+        send_midi(connection, &payload, channel_mode)?;
     }
+}
+
+fn lost_origin(message: &Message, origins: &mut BTreeSet<String>) -> bool {
+    message
+        .body
+        .get("online")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+        && message
+            .body
+            .get("producer_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|origin| origins.remove(origin))
 }
 
 fn reset_midi_output(connection: &mut midir::MidiOutputConnection) -> Result<()> {
@@ -501,5 +625,77 @@ mod tests {
         assert_eq!(messages[2], [0xb0, 123, 0]);
         assert_eq!(messages[45], [0xbf, 64, 0]);
         assert_eq!(messages[47], [0xbf, 123, 0]);
+    }
+
+    #[test]
+    fn hotplug_rebinds_changed_identity_and_leaves_other_inputs_bound() {
+        let mut keyboard = None;
+        let mut pads = None;
+        assert!(reconcile_binding(&mut keyboard, Ok(("usb-1".into(), 1)), Ok).unwrap());
+        assert!(reconcile_binding(&mut pads, Ok(("usb-2".into(), 2)), Ok).unwrap());
+        assert!(
+            !reconcile_binding(
+                &mut keyboard,
+                Ok(("usb-1".into(), 99)),
+                |_| -> Result<i32> { panic!("must retain live handle") }
+            )
+            .unwrap()
+        );
+        assert!(
+            reconcile_binding::<_, i32>(&mut keyboard, Err(anyhow::anyhow!("unplugged")), Ok)
+                .is_err()
+        );
+        assert!(keyboard.is_none());
+        assert_eq!(pads.as_ref().unwrap().1, 2);
+        assert!(reconcile_binding(&mut keyboard, Ok(("usb-3".into(), 3)), Ok).unwrap());
+        assert_eq!(keyboard.unwrap(), ("usb-3".into(), 3));
+    }
+
+    #[test]
+    fn failed_rebind_never_keeps_the_dead_handle() {
+        let mut binding = Some(("old".into(), 1));
+        assert!(
+            reconcile_binding(&mut binding, Ok(("new".into(), ())), |_| Err(
+                anyhow::anyhow!("open failed")
+            ))
+            .is_err()
+        );
+        assert!(binding.is_none());
+    }
+
+    #[test]
+    fn queue_loss_discards_stale_note_events_before_sending_a_complete_reset() {
+        let (sender, receiver) = sync_channel(1);
+        sender.try_send(vec![0x90, 60, 100]).unwrap();
+        assert!(matches!(
+            sender.try_send(vec![0x80, 60, 0]),
+            Err(TrySendError::Full(_))
+        ));
+        let mut delivered = Vec::new();
+        reset_capture(&receiver, |message| {
+            delivered.push(message.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(delivered.len(), 48);
+        assert!(!delivered.iter().any(|message| message[0] & 0xf0 == 0x90));
+        assert!(delivered.contains(&vec![0xb0, 64, 0]));
+        assert!(delivered.contains(&vec![0xbf, 123, 0]));
+    }
+
+    #[test]
+    fn losing_an_active_publisher_resets_notes_but_unrelated_nodes_do_not() {
+        let mut origins = BTreeSet::from(["keys".into()]);
+        let message = |origin: &str, online| {
+            Message::new(
+                unibus::kinds::NODE_STATE,
+                serde_json::json!({"producer_id":origin,"online":online}),
+            )
+        };
+        assert!(!lost_origin(&message("other", false), &mut origins));
+        assert!(!lost_origin(&message("keys", true), &mut origins));
+        assert!(lost_origin(&message("keys", false), &mut origins));
+        assert!(!lost_origin(&message("keys", false), &mut origins));
     }
 }

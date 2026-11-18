@@ -709,9 +709,7 @@ fn mpegts_output_args(primary: &str, mirrors: &[String]) -> Vec<String> {
     }
     let slots = std::iter::once(primary)
         .chain(mirrors.iter().map(String::as_str))
-        .map(|destination| {
-            format!("[f=mpegts:mpegts_flags={MPEGTS_RESEND_HEADERS}]{destination}")
-        })
+        .map(|destination| format!("[f=mpegts:mpegts_flags={MPEGTS_RESEND_HEADERS}]{destination}"))
         .collect::<Vec<_>>()
         .join("|");
     args.extend([

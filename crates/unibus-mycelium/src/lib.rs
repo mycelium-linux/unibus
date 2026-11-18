@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 pub mod access;
+#[cfg(feature = "managed-acl")]
+pub mod policy;
 use unibus::{
     NetworkEndpoint, NetworkEndpointError, PeerCandidate, PeerDirectory, PeerError,
     ServiceDirectory, ServiceObservation, Transport,

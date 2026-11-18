@@ -8,15 +8,24 @@ USB keyboard -> CoreMIDI -> Mac edge -> Unibus -> Pi edge -> ALSA -> Scarlett 18
 ```
 
 The bus transport is reliable and ordered. Capture never blocks CoreMIDI or
-ALSA: a bounded local queue hands packets to the bus writer. A full queue is a
-loud error in the log and drops the new packet. The receiver sends packets
+ALSA: a bounded local queue hands packets to the bus writer. A full queue flags
+loss without logging on the platform callback. The worker discards queued
+events and sends sustain-off, all-sound-off and all-notes-off before forwarding
+fresh events. Events older than 250 ms are discarded with a reset. The receiver sends packets
 immediately; source timestamps are retained for diagnostics, not scheduling.
 
 The bridge supervises its whole runtime session. Loss of the hub, secure
 tunnel, or local MIDI port closes the failed session, then reconnects and
 registers again with bounded exponential backoff (250 ms through 30 s). A
 session healthy for 30 seconds resets the backoff. Configuration errors still
-fail before supervision begins.
+fail before supervision begins. Input ports are re-enumerated once per second
+and rebound by OS identity; an absent or ambiguous input does not disable other
+configured inputs. Output ports are also checked while idle. A hub announcement
+that an active input producer went offline resets the output's notes.
+
+Publish-only input edges drain hub replies on a separate bounded reader. Hub
+rejection and read-side disconnects end the session even while heartbeat writes
+still succeed. Relative token paths resolve beside the bridge configuration.
 
 An output edge sends sustain-off, all-sound-off, and all-notes-off on every
 channel when it opens and when it detects bus loss. This prevents an interrupted

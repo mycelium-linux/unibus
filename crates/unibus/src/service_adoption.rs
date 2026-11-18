@@ -4,6 +4,9 @@
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
+mod lifecycle;
+pub use lifecycle::{AdoptionLease, AdoptionLifecycle, MAX_ADOPTED_SERVICES};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdoptionState {
@@ -49,20 +52,45 @@ mod tests {
 
     #[test]
     fn policy_requires_a_named_node_and_a_nonzero_failure_bound() {
-        assert!(AdoptionPolicy { local_node_id: "studio".into(), max_failures: 3 }.validate().is_ok());
-        assert!(AdoptionPolicy { local_node_id: " ".into(), max_failures: 3 }.validate().is_err());
-        assert!(AdoptionPolicy { local_node_id: "studio".into(), max_failures: 0 }.validate().is_err());
+        assert!(
+            AdoptionPolicy {
+                local_node_id: "studio".into(),
+                max_failures: 3
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            AdoptionPolicy {
+                local_node_id: " ".into(),
+                max_failures: 3
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            AdoptionPolicy {
+                local_node_id: "studio".into(),
+                max_failures: 0
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
     fn lifecycle_status_roundtrips_without_a_protocol_adapter() {
         let status = AdoptionStatus {
-            service_id: "studio/canvas".into(), state: AdoptionState::Degraded,
-            endpoint: Some("http://127.0.0.1:8000".into()), provider_id: None,
-            consecutive_failures: 1, last_error: Some("unavailable".into()),
+            service_id: "studio/canvas".into(),
+            state: AdoptionState::Degraded,
+            endpoint: Some("http://127.0.0.1:8000".into()),
+            provider_id: None,
+            consecutive_failures: 1,
+            last_error: Some("unavailable".into()),
             last_probe_unix_ms: Some(123),
         };
-        let decoded: AdoptionStatus = serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
+        let decoded: AdoptionStatus =
+            serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
         assert_eq!(decoded, status);
     }
 }

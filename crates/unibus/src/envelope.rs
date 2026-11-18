@@ -217,7 +217,7 @@ pub fn next_request_id() -> String {
 mod tests {
     #[test]
     fn leases_allow_bounded_skew_without_extending_expiry() {
-        use super::{lease_is_fresh, MAX_FUTURE_SKEW_MS};
+        use super::{MAX_FUTURE_SKEW_MS, lease_is_fresh};
         assert!(lease_is_fresh(100 + MAX_FUTURE_SKEW_MS, 10_000, 100));
         assert!(!lease_is_fresh(101 + MAX_FUTURE_SKEW_MS, 10_000, 100));
         assert!(!lease_is_fresh(100, 200, 200));

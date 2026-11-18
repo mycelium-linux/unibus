@@ -18,10 +18,11 @@ pub mod direct;
 pub mod discovery;
 pub mod envelope;
 pub mod framing;
-pub mod grants;
 pub mod gateway;
+pub mod grants;
 pub mod kinds;
 pub mod peer;
+pub mod publication_monitor;
 pub mod qos;
 pub mod reconnect;
 pub mod service_adoption;
@@ -46,8 +47,8 @@ pub use framing::{FrameError, decode_frame, encode_frame, read_frame, write_fram
 pub use grants::{NodeGrant, Role, is_valid_namespaced_name, is_valid_slug};
 pub use kinds::Control;
 pub use peer::{
-    IrohPeerEndpoint, PeerAccessPolicy, PeerCandidate, PeerDirectory, PeerError, PeerFuture, PeerSession, PeerTransport, SessionPath,
-    StaticPeerDirectory, connect_direct_or_else,
+    IrohPeerEndpoint, PeerAccessPolicy, PeerCandidate, PeerDirectory, PeerError, PeerFuture,
+    PeerSession, PeerTransport, SessionPath, StaticPeerDirectory, connect_direct_or_else,
 };
 pub use qos::Qos;
 pub use reconnect::{ReconnectBackoff, ReconnectPolicy};

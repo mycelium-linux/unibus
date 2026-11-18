@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 pub mod audio_ingress;
+pub mod audio_session;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use stream_descriptors::{
@@ -109,7 +110,11 @@ impl QemuRfbH264UdpRuntime {
             "zerolatency=true".into(),
             "bframes=0".into(),
             "rc-lookahead=0".into(),
-            format!("gop-size={}", self.fps),
+            // This is an interactive monitor surface, not archival video.
+            // Every frame is independently decodable so a restarted or newly
+            // visible edge never waits on damage-driven RFB cadence for an
+            // IDR, and the Pi stateless decoder never inherits a partial GOP.
+            "gop-size=1".into(),
             format!("bitrate={}", self.bitrate_kbps),
             "repeat-sequence-header=true".into(),
             "!".into(),
@@ -1106,6 +1111,7 @@ mod tests {
         };
         let args = runtime.gstreamer_args().unwrap();
         assert!(args.iter().any(|arg| arg == "incremental=false"));
+        assert!(args.iter().any(|arg| arg == "gop-size=1"));
         assert_eq!(
             args.iter()
                 .filter(|arg| arg.as_str() == "nvh264enc")
