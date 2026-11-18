@@ -1,6 +1,7 @@
 //! Hub configuration. A v1 JARVIS `router.json` must load unchanged;
 //! v2 additions are optional fields.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, ensure};
@@ -57,6 +58,54 @@ pub enum RouteTarget {
     /// Deliver to the producer named by the envelope's `destination`
     /// (request/response correlation, e.g. face-ID replies).
     Producer,
+}
+
+/// The route table: exact kinds first, then the longest declared namespace.
+///
+/// It used to be one line per kind, so a producer that added an event kind was
+/// a hub edit and a restart before anybody could receive it. A rule may name a
+/// namespace — `arborist.*` — and every kind under it follows, which makes a new
+/// kind the producer's business. Exact still wins, so one kind can be diverted
+/// without moving its family, and the longest namespace wins so `fpl.node.*`
+/// beats `fpl.*`.
+#[derive(Debug, Default, Clone)]
+pub struct RouteTable {
+    exact: HashMap<String, RouteTarget>,
+    /// The namespace without its `.*`, with its target, longest first.
+    namespaces: Vec<(String, RouteTarget)>,
+}
+
+impl RouteTable {
+    #[must_use]
+    pub fn new(rules: &[RouteRule]) -> Self {
+        let mut exact = HashMap::new();
+        let mut namespaces = Vec::new();
+        for rule in rules {
+            match rule.kind.strip_suffix(".*") {
+                Some(namespace) => namespaces.push((namespace.to_string(), rule.target.clone())),
+                None => {
+                    exact.insert(rule.kind.clone(), rule.target.clone());
+                }
+            }
+        }
+        namespaces.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+        Self { exact, namespaces }
+    }
+
+    /// The target for `kind`, if any rule covers it.
+    #[must_use]
+    pub fn get(&self, kind: &str) -> Option<&RouteTarget> {
+        if let Some(target) = self.exact.get(kind) {
+            return Some(target);
+        }
+        self.namespaces
+            .iter()
+            .find(|(namespace, _)| {
+                kind.strip_prefix(namespace.as_str())
+                    .is_some_and(|rest| rest.starts_with('.'))
+            })
+            .map(|(_, target)| target)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +257,15 @@ impl HubConfig {
         let mut kinds = std::collections::HashSet::new();
         for rule in &self.routes {
             ensure!(!rule.kind.trim().is_empty(), "route rule with empty kind");
+            // Existing configs name single-segment kinds (`canvas_command`), so
+            // the rule here is only about the wildcard: if there is a star it
+            // has to be the trailing one that makes a namespace. Anything else
+            // is a typo that would silently match nothing.
+            ensure!(
+                !rule.kind.contains('*') || unibus::is_valid_kind_pattern(&rule.kind),
+                "route rule kind {} has a wildcard that is not a trailing `.*`",
+                rule.kind
+            );
             ensure!(
                 kinds.insert(rule.kind.clone()),
                 "duplicate route rule for kind {}",
@@ -221,6 +279,64 @@ impl HubConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rule(kind: &str, name: &str) -> RouteRule {
+        RouteRule {
+            kind: kind.into(),
+            target: RouteTarget::Capability { name: name.into() },
+        }
+    }
+
+    fn name_of(target: &RouteTarget) -> &str {
+        match target {
+            RouteTarget::Capability { name } => name,
+            other => panic!("expected a capability target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_namespace_rule_covers_every_kind_under_it() {
+        let table = RouteTable::new(&[rule("arborist.*", "elmers.consume")]);
+        assert_eq!(
+            table.get("arborist.finding").map(name_of),
+            Some("elmers.consume")
+        );
+        assert_eq!(
+            table.get("arborist.scan").map(name_of),
+            Some("elmers.consume")
+        );
+        // A prefix is not a namespace.
+        assert!(table.get("arboristx.finding").is_none());
+        assert!(table.get("other.finding").is_none());
+    }
+
+    #[test]
+    fn an_exact_rule_beats_the_namespace_that_covers_it() {
+        let table = RouteTable::new(&[
+            rule("arborist.*", "everything"),
+            rule("arborist.audit", "auditors"),
+        ]);
+        assert_eq!(table.get("arborist.audit").map(name_of), Some("auditors"));
+        assert_eq!(table.get("arborist.scan").map(name_of), Some("everything"));
+    }
+
+    #[test]
+    fn the_longest_namespace_wins() {
+        let table = RouteTable::new(&[rule("fpl.*", "wide"), rule("fpl.node.*", "narrow")]);
+        assert_eq!(table.get("fpl.node.health.v1").map(name_of), Some("narrow"));
+        assert_eq!(table.get("fpl.other.thing").map(name_of), Some("wide"));
+    }
+
+    #[test]
+    fn a_star_that_is_not_a_trailing_namespace_is_refused_at_load() {
+        let mut config: HubConfig = serde_json::from_str(include_str!(
+            "../../../deploy/linux/core/etc/unibus/hub.json"
+        ))
+        .unwrap();
+        config.routes.push(rule("arborist.fin*", "typo"));
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("wildcard"), "{error}");
+    }
 
     #[test]
     fn packaged_default_is_local_and_has_no_grants() {

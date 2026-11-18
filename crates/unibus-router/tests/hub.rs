@@ -43,7 +43,8 @@ fn hub_config(dir: &std::path::Path, extra_routes: &str) -> HubConfig {
             {{"producer_id": "brain", "token_file": "token", "zones": ["default", "living-room"], "capabilities": ["display", "audio_output", "presence_capture", "canvas.command"], "publishes": ["canvas_command", "audio_playback_chunk", "test.publish", "fr_response", "mute_request", "totally_unknown_kind"], "publish_zones": ["default", "living-room", "nowhere"], "publish_screen_anchors": ["screen-tv", "screen-left"], "publish_producers": ["tv", "ghost"]}},
             {{"producer_id": "tv", "token_file": "token", "zones": ["living-room"], "capabilities": ["display"], "screen_anchors": ["screen-tv"], "publishes": ["unibus.stream.interest.v1", "unibus.stream.interest.release.v1"]}},
             {{"producer_id": "studio", "token_file": "token", "zones": ["default"], "capabilities": ["display"], "screen_anchors": ["screen-left"], "publishes": ["test.publish"], "publish_zones": ["default"]}},
-            {{"producer_id": "speaker", "token_file": "token", "zones": ["living-room"], "capabilities": ["audio_output", "unibus.stream.source"], "publishes": ["unibus.stream.event.v1"]}}
+            {{"producer_id": "speaker", "token_file": "token", "zones": ["living-room"], "capabilities": ["audio_output", "unibus.stream.source"], "publishes": ["unibus.stream.event.v1"]}},
+            {{"producer_id": "arborist", "token_file": "token", "zones": ["default"], "capabilities": ["arborist.publisher"], "publish_zones": ["default"]}}
         ]
     }}"#
     );
@@ -602,6 +603,35 @@ fn plugin_can_gate_and_fan_out() {
         )
         .unwrap();
     let ack = rogue.recv_reply();
+    assert_eq!(ack.message.body["success"], json!(false));
+}
+
+#[test]
+fn a_producer_publishes_its_own_namespace_with_no_publishes_entry() {
+    // The point of the rule: `arborist` has no `publishes` list at all, and one
+    // namespace route covers every kind it will ever emit. Adding
+    // `arborist.finding` was a change to the producer, not to this hub.
+    let hub =
+        start(r#"{"kind": "arborist.*", "target": {"mode": "capability", "name": "display"}},"#);
+    let mut consumer = hub.node("brain", &["display"], &[]);
+    let mut arborist = hub.node("arborist", &[], &[]);
+
+    arborist
+        .send(
+            Message::new("arborist.finding", json!({"repo": "fpl/bob"})),
+            Some("default"),
+        )
+        .unwrap();
+    let got = consumer.recv_until("arborist.finding");
+    assert_eq!(got.message.body["repo"], json!("fpl/bob"));
+    let ack = arborist.recv_reply();
+    assert_eq!(ack.message.body["success"], json!(true));
+
+    // A namespace is not a licence: somebody else's name is still refused.
+    arborist
+        .send(Message::new("elmers.notice", json!({})), Some("default"))
+        .unwrap();
+    let ack = arborist.recv_reply();
     assert_eq!(ack.message.body["success"], json!(false));
 }
 

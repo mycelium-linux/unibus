@@ -43,7 +43,9 @@ pub use envelope::{
     SCHEMA_VERSION_V1, SCHEMA_VERSION_V2,
 };
 pub use framing::{FrameError, decode_frame, encode_frame, read_frame, write_frame};
-pub use grants::{NodeGrant, Role, is_valid_namespaced_name, is_valid_slug};
+pub use grants::{
+    NodeGrant, Role, is_valid_kind_pattern, is_valid_namespaced_name, is_valid_slug,
+};
 pub use kinds::Control;
 pub use peer::{
     IrohPeerEndpoint, PeerAccessPolicy, PeerCandidate, PeerDirectory, PeerError, PeerFuture, PeerSession, PeerTransport, SessionPath,

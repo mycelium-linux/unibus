@@ -92,6 +92,38 @@ pub fn is_valid_namespaced_name(value: &str) -> bool {
     segments.all(is_valid_slug) && count >= 2
 }
 
+/// A message-kind pattern: a namespaced name, or the namespace followed by
+/// `.*`.
+///
+/// The wildcard is one trailing segment and nothing else — `arborist.*` is a
+/// namespace, `arborist.fin*` is a typo. Everything before the star still has to
+/// be a namespaced name, so a pattern can only ever be narrower than "everything
+/// this producer could name".
+pub fn is_valid_kind_pattern(value: &str) -> bool {
+    match value.strip_suffix(".*") {
+        // A namespace is one or more slugs: `arborist` names a prefix of one
+        // segment, `fpl.node` a prefix of two, and `*` names everything, which
+        // is a policy a person has to write rather than a grant a node gets.
+        Some(namespace) => !namespace.is_empty() && namespace.split('.').all(is_valid_slug),
+        None => is_valid_namespaced_name(value),
+    }
+}
+
+/// Whether `kind` is covered by `allowed`: the same kind, or a declared
+/// namespace.
+///
+/// `arborist.*` covers `arborist.finding` and `arborist.scan` and does not
+/// cover `arboristx.foo`, because the character after the prefix has to be the
+/// dot that made it a namespace.
+fn kind_matches(allowed: &str, kind: &str) -> bool {
+    match allowed.strip_suffix(".*") {
+        Some(namespace) => kind
+            .strip_prefix(namespace)
+            .is_some_and(|rest| rest.starts_with('.')),
+        None => allowed == kind,
+    }
+}
+
 /// Single-segment identifier: `living-room`, `screen-tv`, `home-lan`.
 pub fn is_valid_slug(value: &str) -> bool {
     if value.is_empty() || value.len() > 64 {
@@ -113,7 +145,7 @@ impl NodeGrant {
                 &self.capabilities,
                 is_valid_namespaced_name as fn(&str) -> bool,
             ),
-            ("message_kind", &self.publishes, is_valid_namespaced_name),
+            ("message_kind", &self.publishes, is_valid_kind_pattern),
             ("zone", &self.zones, is_valid_slug),
             ("publish_zone", &self.publish_zones, is_valid_slug),
             ("screen_anchor", &self.screen_anchors, is_valid_slug),
@@ -204,14 +236,87 @@ impl NodeGrant {
         claimed.iter().all(|c| self.can(c))
     }
 
+    /// Whether this node may publish `kind`.
+    ///
+    /// Two ways to earn it, and the second is the one that keeps the hub out of
+    /// the way: an explicit grant, or the node's own namespace. `arborist` may
+    /// publish `arborist.finding` because it is called `arborist` — so a new
+    /// event kind is a change to the producer and to nothing else. A producer
+    /// can never reach outside its own name this way, and a declared `ns.*`
+    /// pattern is still how a node reaches a namespace it does not own.
     pub fn may_publish(&self, kind: &str) -> bool {
-        self.publishes.iter().any(|allowed| allowed == kind)
+        if self
+            .publishes
+            .iter()
+            .any(|allowed| kind_matches(allowed, kind))
+        {
+            return true;
+        }
+        kind.strip_prefix(self.producer_id.as_str())
+            .is_some_and(|rest| rest.starts_with('.'))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A grant named `arborist` that declares nothing. Its own namespace is the
+    /// only thing it may publish.
+    fn own_namespace_only() -> NodeGrant {
+        NodeGrant {
+            producer_id: "arborist".into(),
+            auth_subject: "arborist".into(),
+            zones: vec!["default".into()],
+            publish_zones: vec!["default".into()],
+            capabilities: Vec::new(),
+            publishes: Vec::new(),
+            publish_screen_anchors: Vec::new(),
+            publish_producers: Vec::new(),
+            screen_anchors: Vec::new(),
+            site: "default".into(),
+            role: Role::default(),
+        }
+    }
+
+    #[test]
+    fn a_producer_may_publish_its_own_namespace_without_listing_the_kinds() {
+        let grant = own_namespace_only();
+        assert!(grant.may_publish("arborist.scan"));
+        assert!(grant.may_publish("arborist.finding"));
+        // The point of the rule: a new kind is not a hub configuration change.
+        assert!(grant.may_publish("arborist.anything.at.all"));
+    }
+
+    #[test]
+    fn a_producer_may_not_reach_outside_its_own_namespace() {
+        let grant = own_namespace_only();
+        assert!(!grant.may_publish("elmers.notice"));
+        // A prefix is not a namespace: `arboristx` is somebody else.
+        assert!(!grant.may_publish("arboristx.scan"));
+        // The bare name is not a namespaced kind either.
+        assert!(!grant.may_publish("arborist"));
+    }
+
+    #[test]
+    fn a_declared_pattern_covers_its_namespace_and_the_exact_name_still_works() {
+        let mut grant = own_namespace_only();
+        grant.publishes = vec!["canvas.*".into(), "fpl.node.health.v1".into()];
+        assert!(grant.may_publish("canvas.command"));
+        assert!(grant.may_publish("fpl.node.health.v1"));
+        assert!(!grant.may_publish("canvasx.command"));
+        assert!(!grant.may_publish("fpl.node.health"));
+    }
+
+    #[test]
+    fn a_pattern_is_one_trailing_star_and_nothing_else() {
+        assert!(is_valid_kind_pattern("arborist.*"));
+        assert!(is_valid_kind_pattern("arborist.scan"));
+        assert!(!is_valid_kind_pattern("arborist.*.scan"));
+        assert!(!is_valid_kind_pattern("arborist.fin*"));
+        assert!(!is_valid_kind_pattern("*"));
+        assert!(!is_valid_kind_pattern("arborist."));
+    }
 
     fn grant() -> NodeGrant {
         NodeGrant {

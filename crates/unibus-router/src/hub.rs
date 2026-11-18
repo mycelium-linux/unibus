@@ -74,7 +74,7 @@ impl Sink for LiveConnection {
 pub struct Hub {
     config: Arc<HubConfig>,
     grants: Arc<HashMap<String, NodeConfig>>,
-    routes: Arc<HashMap<String, RouteTarget>>,
+    routes: Arc<crate::config::RouteTable>,
     registry: Arc<Mutex<NodeRegistry>>,
     conns: Arc<Mutex<HashMap<String, Arc<dyn Sink>>>>,
     /// Frames that reached nobody, kept briefly so a consumer that reconnects
@@ -233,11 +233,7 @@ impl Hub {
             .iter()
             .map(|n| (n.producer_id.clone(), n.clone()))
             .collect();
-        let routes = config
-            .routes
-            .iter()
-            .map(|r| (r.kind.clone(), r.target.clone()))
-            .collect();
+        let routes = crate::config::RouteTable::new(&config.routes);
         #[cfg(feature = "viewer")]
         let widget_store = Arc::new(crate::viewer::widgets::Store::default());
         let state_dir = config.state_dir.clone();
