@@ -17,6 +17,9 @@ use crate::{Envelope, FrameError, Message, SCHEMA_VERSION_V1, framing, kinds};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const DEFAULT_READ_TIMEOUT_MS: u64 = 10_000;
+/// Budget for the registration round trip. Polling reads stay short; a hub
+/// reached over a WAN still needs a full round trip to answer `register`.
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,6 +40,8 @@ pub struct ClientConfig {
     pub schema_version: u32,
     #[serde(default = "default_read_timeout_ms")]
     pub read_timeout_ms: u64,
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
 }
 
 fn default_schema() -> u32 {
@@ -45,6 +50,10 @@ fn default_schema() -> u32 {
 
 fn default_read_timeout_ms() -> u64 {
     DEFAULT_READ_TIMEOUT_MS
+}
+
+fn default_connect_timeout_ms() -> u64 {
+    DEFAULT_CONNECT_TIMEOUT_MS
 }
 
 impl ClientConfig {
@@ -73,6 +82,68 @@ fn valid_env_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slow_handshake_is_bounded_by_the_connect_budget_not_the_poll_budget() {
+        // A hub 70 ms away answers `register` long after a 10 ms poll read gives
+        // up. The handshake must spend the connect budget, then hand the socket
+        // back to the poll budget so polling stays non-blocking.
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let endpoint = listener.local_addr().expect("address").to_string();
+        let token_path = std::env::temp_dir().join(format!(
+            "unibus-handshake-{}.token",
+            std::process::id()
+        ));
+        std::fs::write(&token_path, b"private-test-token").expect("write token");
+
+        let hub = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let (register, _) = framing::read_frame(&mut stream).expect("register");
+            std::thread::sleep(Duration::from_millis(300));
+            let reply = Envelope::new(
+                "home",
+                "hub",
+                None,
+                "unused",
+                Message::new(
+                    kinds::V1_REPLY,
+                    serde_json::json!({
+                        "request_id": register.request_id,
+                        "success": true,
+                    }),
+                ),
+            );
+            framing::write_frame(&mut stream, &reply, &[]).expect("reply");
+            stream
+        });
+
+        let config: ClientConfig = serde_json::from_value(serde_json::json!({
+            "installation_id": "home",
+            "producer_id": "elmers",
+            "hub_endpoint": endpoint,
+            "token_file": token_path,
+            "zones": ["default"],
+            "read_timeout_ms": 10,
+            "connect_timeout_ms": 5_000,
+        }))
+        .expect("config");
+        assert_eq!(config.connect_timeout_ms, 5_000);
+
+        let started = std::time::Instant::now();
+        let client = Client::connect(config).expect("slow handshake must register");
+        assert!(started.elapsed() >= Duration::from_millis(280));
+
+        // The socket is back on the poll budget: an idle read returns promptly.
+        let idle_started = std::time::Instant::now();
+        assert!(client.try_read().expect("idle read").is_none());
+        assert!(idle_started.elapsed() < Duration::from_millis(200));
+        drop(client);
+        drop(hub);
+        let _ = std::fs::remove_file(&token_path);
+    }
 
     #[test]
     fn token_source_is_explicit_and_environment_names_are_bounded() {
@@ -110,7 +181,17 @@ impl Client {
             (1..=60_000).contains(&config.read_timeout_ms),
             "read_timeout_ms must be 1..=60000"
         );
-        stream.set_read_timeout(Some(Duration::from_millis(config.read_timeout_ms)))?;
+        ensure!(
+            (1..=60_000).contains(&config.connect_timeout_ms),
+            "connect_timeout_ms must be 1..=60000"
+        );
+        // The registration exchange is one round trip, which a remote hub cannot
+        // answer inside a poll budget: a consumer polling every 10 ms would give
+        // up on a hub 70 ms away. Spend the connect budget on the handshake, then
+        // tighten the socket back to the poll budget before returning.
+        let handshake_timeout =
+            Duration::from_millis(config.connect_timeout_ms.max(config.read_timeout_ms));
+        stream.set_read_timeout(Some(handshake_timeout))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let token = config.token()?;
         let mut register = Envelope::new(
@@ -156,6 +237,7 @@ impl Client {
             );
             break;
         }
+        reader.set_read_timeout(Some(Duration::from_millis(config.read_timeout_ms)))?;
 
         let stop = Arc::new(AtomicBool::new(false));
         {
