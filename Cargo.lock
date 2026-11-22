@@ -4717,6 +4717,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "unibus-frigate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rumqttc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "unibus",
+ "unibus-mqtt",
+]
+
+[[package]]
 name = "unibus-hdhomerun"
 version = "0.1.0"
 dependencies = [
