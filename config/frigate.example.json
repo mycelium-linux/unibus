@@ -1,0 +1,22 @@
+{
+  "bus": {
+    "installation_id": "home",
+    "producer_id": "frigate-home",
+    "hub_endpoint": "127.0.0.1:18790",
+    "token_file": "frigate-home.token",
+    "zones": ["home"],
+    "capabilities": ["frigate.events"],
+    "schema_version": 2,
+    "read_timeout_ms": 10
+  },
+  "mqtt": {
+    "host": "127.0.0.1",
+    "port": 1883,
+    "client_id": "frigate-home",
+    "tls": false,
+    "username_env": "FRIGATE_MQTT_USERNAME",
+    "password_env": "FRIGATE_MQTT_PASSWORD",
+    "keep_alive_secs": 30
+  },
+  "topic_prefix": "frigate"
+}
